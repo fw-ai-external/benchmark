@@ -618,8 +618,13 @@ def test_stream_delta_cache_never_keyerrors_on_the_threshold_entry() -> None:
     StreamDeltaTokens._cache.clear()
     tok = Tok()
     try:
-        for i in range(70000):  # well past the 65,536 bound, many distinct texts
+        for i in range(65536):  # fill to the bound
             StreamDeltaTokens.count(tok, f"word-{i}")
-        assert StreamDeltaTokens.count(tok, "word-0") == 6  # re-counted after a clear, still right
+        # the entry that crosses the bound: its count is right (R148-7: an earlier fix stored 1),
+        # on the crossing call and on a later lookup
+        assert StreamDeltaTokens.count(tok, "word-65536") == len("word-65536")
+        assert StreamDeltaTokens.count(tok, "word-65536") == len("word-65536")
+        for i in range(70000):  # many more crossings, none raises and none miscounts
+            assert StreamDeltaTokens.count(tok, f"w-{i}") == len(f"w-{i}")
     finally:
         StreamDeltaTokens._cache.clear()
