@@ -4525,8 +4525,11 @@ class StreamDeltaTokens:
     def count(cls, tokenizer, text: str) -> int:
         if text not in cls._cache:
             cls._cache[text] = len(tokenizer.encode(text, add_special_tokens=False)) if tokenizer else 0
-        if len(cls._cache) > 65536:
-            cls._cache.clear()
+            if len(cls._cache) > 65536:
+                # Bound the cache, but never the entry just added: clearing here made the lookup below
+                # KeyError on exactly the text that crossed the threshold (12 requests in P9's first cell)
+                cls._cache.clear()
+                cls._cache[text] = cls._cache.get(text, 1)
         return cls._cache[text]
 
 

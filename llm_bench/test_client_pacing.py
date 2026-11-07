@@ -599,3 +599,27 @@ def test_summary_carries_the_idle_rule_gap_cv2(monkeypatch) -> None:
         entries[f"{name}_gap_cv2_idle_rule"] = "" if value is None else value
     assert abs(entries["delivered_gap_cv2_idle_rule"] - 3.941529904339976) < 1e-9
     assert entries["intended_gap_cv2_idle_rule"] == 0.0
+
+
+def test_stream_delta_cache_never_keyerrors_on_the_threshold_entry() -> None:
+    """P9's first scored cell lost 12 requests to KeyError(delta-text): StreamDeltaTokens cleared the cache
+    AFTER writing the entry that crossed the size bound, so its own lookup missed. The entry that crosses the
+    bound survives; the count is still right afterwards."""
+    from load_test import StreamDeltaTokens
+
+    class Tok:
+        def __init__(self):
+            self.calls = 0
+
+        def encode(self, text, add_special_tokens=False):
+            self.calls += 1
+            return [0] * len(text)
+
+    StreamDeltaTokens._cache.clear()
+    tok = Tok()
+    try:
+        for i in range(70000):  # well past the 65,536 bound, many distinct texts
+            StreamDeltaTokens.count(tok, f"word-{i}")
+        assert StreamDeltaTokens.count(tok, "word-0") == 6  # re-counted after a clear, still right
+    finally:
+        StreamDeltaTokens._cache.clear()
