@@ -45,6 +45,7 @@ import urllib3.connection
 import urllib3.connectionpool
 from locust.clients import LocustHttpAdapter
 from locust.runners import MasterRunner
+from locust.exception import StopUser
 from locust.util.timespan import parse_timespan as _locust_parse_timespan
 
 logging.basicConfig(
@@ -1384,7 +1385,11 @@ _SESSION_TAIL_START = SHAPE_MIX_TAIL_START.lstrip()
 # code_corpus.LICENSE.txt); code.txt stays --dataset code's file
 _BUILTIN_CORPORA = {
     name: os.path.join(os.path.dirname(os.path.abspath(__file__)), file)
-    for name, file in (("prose", "prose_corpus.txt.gz"), ("limericks", "limericks.txt"), ("code", "code_corpus.txt.gz"))
+    for name, file in (
+        ("prose", "prose_corpus.txt.gz"),
+        ("limericks", "limericks.txt"),
+        ("code", "code_corpus.txt.gz"),
+    )
 }
 
 
@@ -2272,7 +2277,9 @@ class ShapeMixDataset:
                 if segments
                 else 0
             )
-            tail = (content - reused - joint) if content is not None else self._tail_tokens(ci) + (pool_tokens - reused)
+            tail = (
+                (content - reused - joint) if content is not None else self._tail_tokens(ci) + (pool_tokens - reused)
+            )
             if tail < min_tail:
                 # input_length below template + nonce + instruction: sent longer than recorded, and counted
                 if content is not None:
@@ -2798,7 +2805,9 @@ def _release_free_memory() -> None:
         pass
 
 
-def build_shape_mix_request(provider, request: ShapeRequest, output_mode: str = "exact") -> tuple[dict, Optional[dict]]:
+def build_shape_mix_request(
+    provider, request: ShapeRequest, output_mode: str = "exact"
+) -> tuple[dict, Optional[dict]]:
     """Payload for the class's output length, plus the affinity header that routes by shared prefix.
 
     "exact" forces generated_tokens (max_tokens = min_tokens, ignore_eos); "max" only caps the output at
@@ -3745,7 +3754,9 @@ def retime_rows(entries: tuple, retime: tuple[str, float], seed, min_parent_gap:
         ]
         retimed.sort(key=lambda e: (e.offset, e.index))
         return lead_ins + tuple(retimed)
-    retimed = tuple(dataclasses.replace(e, offset=first + o, recorded_offset=e.offset) for e, o in zip(scored, offsets))
+    retimed = tuple(
+        dataclasses.replace(e, offset=first + o, recorded_offset=e.offset) for e, o in zip(scored, offsets)
+    )
     return lead_ins + retimed
 
 
@@ -4996,6 +5007,217 @@ class ChunkMetadata:
     has_reasoning_only: bool = False  # chunk has reasoning/thinking content but no visible content
 
 
+@dataclass
+class CohortTrace:
+    """Positive token-ID groups on the client's monotonic clock, never SSE-event counts."""
+
+    request_id: Optional[str] = None
+    progress: list[tuple[float, int]] = dataclasses.field(default_factory=list)
+
+    def observe(self, chunk: dict, timestamp: float) -> None:
+        request_id = chunk.get("id")
+        if request_id is not None:
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError("invalid cohort response ID")
+            if self.request_id is not None and request_id != self.request_id:
+                raise ValueError("cohort response ID changed within a stream")
+            self.request_id = request_id
+        choices = chunk.get("choices", [])
+        if not choices:
+            return  # A trailing usage-only frame is not a token-arrival event.
+        if len(choices) != 1:
+            raise ValueError("cohort mode requires exactly one choice")
+        choice = choices[0]
+        content = choice.get("internal_content")
+        if content is None:
+            content = choice.get("delta", {}).get("internal_content")
+        if content is None:
+            return
+        blocks = [content] if isinstance(content, dict) else content
+        count = 0
+        for block in blocks:
+            ids = block.get("token_ids", [])
+            if not isinstance(ids, list) or any(type(token) is not int or token < 0 for token in ids):
+                raise ValueError("invalid cohort token IDs")
+            count += len(ids)
+        if count:
+            total = self.progress[-1][1] if self.progress else 0
+            self.progress.append((timestamp, total + count))
+
+    def validate(self, completion_tokens: Optional[int], expected: int) -> None:
+        if not self.request_id or not self.progress:
+            raise ValueError("cohort mode requires response IDs and streaming internal_content token IDs")
+        if (
+            type(completion_tokens) is not int
+            or self.progress[-1][1] != completion_tokens
+            or completion_tokens != expected
+        ):
+            raise ValueError("cohort token-ID total must equal usage.completion_tokens and --max-tokens")
+
+
+def cohort_window(traces: list[CohortTrace], minimum_fraction: float) -> dict[str, Any]:
+    """Client-arrival overlap (T0,T1]; one sample per complete cohort."""
+    if not traces or any(not trace.progress or not trace.request_id for trace in traces):
+        raise ValueError("cohort has an incomplete request")
+    if len({trace.request_id for trace in traces}) != len(traces):
+        raise ValueError("cohort has duplicate response IDs")
+    start = max(trace.progress[0][0] for trace in traces)
+    end = min(trace.progress[-1][0] for trace in traces)
+    if end <= start:
+        raise ValueError("cohort has no positive common decode window")
+    retained = []
+    for trace in traces:
+        at_start = next((n for t, n in reversed(trace.progress) if t <= start), 0)
+        at_end = next((n for t, n in reversed(trace.progress) if t <= end), 0)
+        tokens = at_end - at_start
+        if tokens <= 0 or tokens / trace.progress[-1][1] < minimum_fraction:
+            raise ValueError("cohort common-window token coverage is below --cohort-min-fraction")
+        retained.append({"id": trace.request_id, "n_start": at_start, "n_end": at_end, "total": trace.progress[-1][1]})
+    count = sum(row["n_end"] - row["n_start"] for row in retained)
+    return {
+        "cohort_decode_lpt": 1000 * len(traces) * (end - start) / count,
+        "cohort_window_ms": 1000 * (end - start),
+        "cohort_window_tokens": count,
+        "cohort_min_retained_fraction": min((r["n_end"] - r["n_start"]) / r["total"] for r in retained),
+        "start": start,
+        "end": end,
+        "requests": retained,
+    }
+
+
+class DecodeCohorts:
+    """Two barriers: all users ready to send, then every response fully drained."""
+
+    def __init__(self, environment: Any) -> None:
+        self.environment = environment
+        self.options = environment.parsed_options
+        self.size = self.options.num_users
+        self.completed = 0
+        self.measured = 0
+        self.error = ""
+        self.ready = gevent.event.Event()
+        self.drained = gevent.event.Event()
+        self.arrived = 0
+        self.traces: list[CohortTrace] = []
+        self.deadline: Optional[gevent.Greenlet] = None
+
+    def abort(self, message: str) -> None:
+        if not self.error:
+            self.error = message
+            logger.error("Decode cohort failed: %s", message)
+            self.ready.set()
+            self.drained.set()
+            gevent.spawn(self.environment.runner.quit)
+
+    def begin(self) -> None:
+        if self.error or self.completed == self.options.cohorts + self.options.cohort_warmup:
+            raise StopUser()
+        ready = self.ready
+        self.arrived += 1
+        if self.arrived == self.size:
+            self.deadline = gevent.spawn_later(
+                self.options.cohort_timeout, self.abort, "cohort exceeded --cohort-timeout"
+            )
+            ready.set()
+        if not ready.wait(timeout=self.options.cohort_timeout):
+            self.abort("timed out waiting for all cohort users")
+        if self.error:
+            raise StopUser()
+
+    def finish(self, trace: Optional[CohortTrace]) -> None:
+        drained = self.drained
+        if trace is None:
+            self.abort("a cohort request failed or was interrupted")
+        if self.error:
+            raise StopUser()
+        self.traces.append(trace)
+        if len(self.traces) == self.size:
+            self.deadline.kill()
+            try:
+                result = cohort_window(self.traces, minimum_fraction=self.options.cohort_min_fraction)
+            except ValueError as error:
+                self.abort(str(error))
+                raise StopUser() from error
+            warmup = self.completed < self.options.cohort_warmup
+            logger.info("Decode cohort: %s", json.dumps({"index": self.completed + 1, "warmup": warmup, **result}))
+            if not warmup:
+                for name in (
+                    "cohort_decode_lpt",
+                    "cohort_window_ms",
+                    "cohort_window_tokens",
+                    "cohort_min_retained_fraction",
+                ):
+                    add_custom_metric(name, result[name])
+                self.measured += 1
+            self.completed += 1
+            self.ready, self.drained = gevent.event.Event(), gevent.event.Event()
+            self.arrived, self.traces = 0, []
+            drained.set()
+            if self.measured == self.options.cohorts:
+                gevent.spawn(self.environment.runner.quit)
+        if not drained.wait(timeout=self.options.cohort_timeout):
+            self.abort("timed out waiting for the cohort to drain")
+        if self.error:
+            raise StopUser()
+
+
+def validate_cohort_options(options: argparse.Namespace) -> None:
+    incompatible = (
+        "qps",
+        "burst",
+        "ramping_time",
+        "shape_mix",
+        "replay_schedule",
+        "prefix_fill",
+        "prefix_reuse_probe",
+        "max_requests",
+        "cancel_rate",
+        "first_visible_token",
+        "embeddings",
+        "rerank",
+        "systemone",
+        "master",
+        "worker",
+        "processes",
+    )
+    if any(getattr(options, name, None) for name in incompatible):
+        raise ValueError(
+            "--cohorts requires single-process fixed-concurrency text generation without pacing or cancellation"
+        )
+    if (
+        options.cohorts < 1
+        or options.cohort_warmup < 0
+        or not options.num_users
+        or options.num_users < 1
+        or options.provider != "fireworks"
+        or not options.stream
+        or options.n != 1
+        or not options.headless
+        or options.max_tokens <= 1
+        or options.max_tokens_distribution != "constant"
+        or not 0 < options.cohort_min_fraction <= 1
+        or not math.isfinite(options.cohort_timeout)
+        or options.cohort_timeout <= 0
+    ):
+        raise ValueError(
+            "invalid --cohorts settings: require --headless --provider fireworks --stream, -n 1, -u >0, "
+            "constant output >1 and valid cohort limits"
+        )
+
+
+@events.init.add_listener
+def _init_decode_cohorts(environment: Any, **_kwargs: Any) -> None:
+    options = environment.parsed_options
+    if not getattr(options, "cohorts", 0):
+        return
+    try:
+        validate_cohort_options(options)
+    except ValueError as error:
+        logger.error(str(error))
+        sys.exit(1)
+    environment.decode_cohorts = DecodeCohorts(environment)
+
+
 class BaseProvider(abc.ABC):
     DEFAULT_MODEL_NAME = None
 
@@ -5272,10 +5494,12 @@ class FireworksProvider(OpenAIProvider):
         logger.info(f"Loaded {len(texts)} forced generation texts from {path}")
         return texts
 
-    def format_payload(self, prompt, max_tokens, images):
+    def format_payload(self, prompt: Any, max_tokens: int, images: Any) -> dict[str, Any]:
         data = super().format_payload(prompt, max_tokens, images)
         if self.parsed_options.rerank or getattr(self.parsed_options, "systemone", False):
             return data
+        if getattr(self.parsed_options, "cohorts", 0):
+            data.setdefault("stream_options", {})["include_internal_content"] = True
         if self.parsed_options.force_min_tokens:
             data["min_tokens"] = max_tokens
         if getattr(self.parsed_options, "ignore_eos", False):
@@ -5763,7 +5987,9 @@ class LLMUser(HttpUser):
             logging_params["shape_mix_output_mode"] = self.environment.parsed_options.shape_mix_output_mode
             logging_params["shape_mix_sample_lengths"] = self.environment.parsed_options.shape_mix_sample_lengths
             logging_params["prefix_popularity_zipf"] = self.environment.parsed_options.prefix_popularity_zipf or ""
-            logging_params["prefix_restore_boundary"] = resolve_prefix_restore_boundary(self.environment.parsed_options)
+            logging_params["prefix_restore_boundary"] = resolve_prefix_restore_boundary(
+                self.environment.parsed_options
+            )
 
         InitTracker.notify_init(self.environment, logging_params)
 
@@ -5984,7 +6210,21 @@ class LLMUser(HttpUser):
             raise ValueError(f"Invalid prompt images positioning: {prompt_images_positioning}")
 
     @task
-    def generate_text(self):
+    def generate_text(self) -> None:
+        cohort = getattr(self.environment, "decode_cohorts", None)
+        if cohort is not None:
+            try:
+                prepared = self._prepare_text_request()
+            except Exception as error:
+                cohort.abort(f"failed to prepare cohort request: {error}")
+                raise StopUser() from error
+            cohort.begin()
+            trace = None
+            try:
+                trace = self._do_generate_text(prepared=prepared, cohort_trace=CohortTrace())
+            finally:
+                cohort.finish(trace)
+            return
         if getattr(self.environment.parsed_options, "prefix_reuse_probe", False):
             self._run_prefix_reuse_probe()
             return
@@ -6183,7 +6423,9 @@ class LLMUser(HttpUser):
                 PrefixFill.prompt_tokens_sent += request.prompt_tokens
                 PrefixFill.prefix_tokens_sent += ds._head + ds.prefix_tokens[ci]
                 PrefixFill.requests += 1
-                pool.spawn(self._send_paced, (data, headers, 1, request.prompt_tokens, request, json.dumps(data)), None)
+                pool.spawn(
+                    self._send_paced, (data, headers, 1, request.prompt_tokens, request, json.dumps(data)), None
+                )
             pool.join()  # a pass completes before the next starts
         PrefixFill.seconds = time.monotonic() - started
         logger.info(
@@ -6394,7 +6636,12 @@ class LLMUser(HttpUser):
             data["model"] = request_model  # --lora-adapters: the request goes to this adapter
         return data, request_headers, max_tokens, prompt_tokens, shape_request, json.dumps(data)
 
-    def _do_generate_text(self, prepared=None, intended=None):
+    def _do_generate_text(
+        self,
+        prepared: Optional[tuple] = None,
+        intended: Optional[float] = None,
+        cohort_trace: Optional[CohortTrace] = None,
+    ) -> Optional[CohortTrace]:
         if self.environment.parsed_options.systemone:
             self._do_systemone_request()
             return
@@ -6538,6 +6785,8 @@ class LLMUser(HttpUser):
                             done = True
                             continue
                     data = orjson.loads(chunk)
+                    if cohort_trace is not None:
+                        cohort_trace.observe(data, timestamp=now)
                     # Capture perf_metrics if present (usually in final usage chunk)
                     if data.get("perf_metrics"):
                         perf_metrics = data["perf_metrics"]
@@ -6582,6 +6831,14 @@ class LLMUser(HttpUser):
                     class_name=class_name,
                 )
                 return
+            if cohort_trace is not None:
+                try:
+                    if not done:
+                        raise ValueError("cohort stream ended without [DONE]")
+                    cohort_trace.validate(completion_tokens, expected=max_tokens)
+                except ValueError as error:
+                    fail_request(response, error, class_name=class_name, kind="other_error")
+                    return
             if t_first_token is None:
                 if max_tokens == 0:
                     t_first_token = time.perf_counter()
@@ -6614,7 +6871,9 @@ class LLMUser(HttpUser):
             dur_generation = now - t_effective_first
             dur_first_token = t_effective_first - t_start
 
-            if not (self.provider_formatter.parsed_options.embeddings or self.provider_formatter.parsed_options.rerank):
+            if not (
+                self.provider_formatter.parsed_options.embeddings or self.provider_formatter.parsed_options.rerank
+            ):
                 prompt_tokens = prompt_tokens or self.prompt_tokenizer_tokens
 
             token_parts = []
@@ -6672,7 +6931,9 @@ class LLMUser(HttpUser):
                 add_custom_metric("time_to_first_token", dur_first_token * 1000)
             add_custom_metric("total_latency", dur_total * 1000)
             if num_tokens:
-                exact_length = shape_request is None or self.environment.parsed_options.shape_mix_output_mode == "exact"
+                exact_length = (
+                    shape_request is None or self.environment.parsed_options.shape_mix_output_mode == "exact"
+                )
                 if num_tokens != max_tokens and exact_length:
                     logger.warning(f"wrong number of tokens: {num_tokens}, expected {max_tokens}")
                 add_custom_metric("generation_tokens", num_tokens)  # backward-compat alias; see logging_params
@@ -6731,6 +6992,7 @@ class LLMUser(HttpUser):
 
             # Notify request completion and check if we should stop
             InitTracker.notify_request_complete()
+        return cohort_trace
 
 
 def parse_resolution(res_str):
@@ -6745,7 +7007,29 @@ def parse_resolution(res_str):
 
 
 @events.init_command_line_parser.add_listener
-def init_parser(parser):
+def init_parser(parser: Any) -> None:
+    parser.add_argument(
+        "--cohorts",
+        env_var="COHORTS",
+        type=int,
+        default=0,
+        help="Measure this many synchronized decode cohorts of -u requests (Fireworks, single-process headless only).",
+    )
+    parser.add_argument(
+        "--cohort-warmup", type=int, default=1, help="Complete cohorts before recording cohort metrics."
+    )
+    parser.add_argument(
+        "--cohort-min-fraction",
+        type=float,
+        default=0.85,
+        help="Minimum fraction of every request's output tokens retained in the common window.",
+    )
+    parser.add_argument(
+        "--cohort-timeout",
+        type=float,
+        default=600,
+        help="Maximum seconds for a cohort or its user rendezvous; failure stops the run.",
+    )
     parser.add_argument(
         "--provider",
         choices=list(PROVIDER_CLASS_MAP.keys()),
@@ -7598,7 +7882,7 @@ def record_systemone_server_timings(headers) -> None:
 SERVER_SIDE_TEXT_METRICS = ["server_side_time_to_first_token", "server_side_total_latency"]
 
 
-def text_summary_entries(stats, stream: bool) -> tuple[dict[str, Any], list[str]]:
+def text_summary_entries(stats: Any, stream: bool) -> tuple[dict[str, Any], list[str]]:
     """Summary entries and percentile metrics for text completion runs.
 
     Server-side metrics are only reported when the provider recorded them
@@ -7638,6 +7922,16 @@ def text_summary_entries(stats, stream: bool) -> tuple[dict[str, Any], list[str]
         if (metric_name, "METRIC") in stats.entries:
             entries[metric_name] = _avg(metric_name)
             percentile_metrics.append(metric_name)
+    for metric_name in (
+        "cohort_decode_lpt",
+        "cohort_window_ms",
+        "cohort_window_tokens",
+        "cohort_min_retained_fraction",
+    ):
+        if (metric_name, "METRIC") in stats.entries:
+            entries[metric_name] = _avg(metric_name)
+            if metric_name == "cohort_decode_lpt":
+                percentile_metrics.append(metric_name)
     return entries, percentile_metrics
 
 
@@ -7901,12 +8195,14 @@ def systemone_summary_entries(stats, num_questions: int) -> dict[str, Any]:
 
 
 @events.quitting.add_listener
-def _(environment, **kw):
+def _(environment: Any, **kw: Any) -> None:
     total_latency = environment.stats.entries.get(("total_latency", "METRIC"))  # None: no scored request ran
+    cohort = getattr(environment, "decode_cohorts", None)
+    cohort_failed = cohort is not None and (bool(cohort.error) or cohort.measured != cohort.options.cohorts)
     num_requests, num_failures = request_counts(environment.stats)
     fail_ratio = (num_failures / num_requests) if num_requests > 0 else 1.0
     outcomes = request_outcome_entries(environment.stats)
-    if fail_ratio > environment.parsed_options.max_fail_ratio or total_latency is None:
+    if fail_ratio > environment.parsed_options.max_fail_ratio or total_latency is None or cohort_failed:
         logger.error(
             f"Test failed: {num_failures}/{num_requests} requests failed ({fail_ratio:.2%}); "
             f"load-shed (429/503) {outcomes['requests_load_shed']}, timeouts {outcomes['requests_timeout']}, "
@@ -7956,7 +8252,9 @@ def _(environment, **kw):
             entries[metric_name] = _avg(metric_name)
         percentile_metrics = ["total_latency", "latency_per_embedding", "server_side_total_latency"]
     elif getattr(environment.parsed_options, "systemone", False):
-        entries.update(systemone_summary_entries(environment.stats, environment.parsed_options.systemone_num_questions))
+        entries.update(
+            systemone_summary_entries(environment.stats, environment.parsed_options.systemone_num_questions)
+        )
         percentile_metrics = [
             "total_latency",
             "server_side_total_latency",
@@ -7977,13 +8275,22 @@ def _(environment, **kw):
     else:
         text_entries, percentile_metrics = text_summary_entries(environment.stats, environment.parsed_options.stream)
         entries.update(text_entries)
+    if cohort is not None:
+        entries.update(
+            cohorts_requested=cohort.options.cohorts,
+            cohorts_completed=cohort.measured,
+            cohort_warmup=cohort.options.cohort_warmup,
+            cohort_failure=cohort.error or ("incomplete cohort schedule" if cohort_failed else ""),
+        )
 
     # Successful requests (failed ones are in the outcome counts); nothing succeeded: 0
     entries["num_requests"] = total_latency.num_requests if total_latency is not None else 0
     entries["qps"] = total_latency.total_rps if total_latency is not None else 0.0
     # A row from a run that failed its --max-fail-ratio (or sent no scored request) must not read as a data
     # point: mark it (N10-145-1)
-    entries["failed"] = int(fail_ratio > environment.parsed_options.max_fail_ratio or total_latency is None)
+    entries["failed"] = int(
+        fail_ratio > environment.parsed_options.max_fail_ratio or total_latency is None or cohort_failed
+    )
     entries["fail_ratio"] = fail_ratio
     percentile_to_report = [50, 90, 95, 99, 99.9]
     for percentile_metric in percentile_metrics:

@@ -44,6 +44,61 @@ There are several primary modes the script can be used:
    - `--qps` is per process: a second process sends the full rate again. Sends are open loop and not capped in flight, so against a stalled server at a high rate the client can run out of file descriptors (raise `ulimit -n` or lower the rate). `Timed Sends` can be higher than the requests counted at the end of a run, because it includes sends still waiting for a response.
    - `--summary-file` appends take a lock (`<file>.lock`), so parallel runs can share one file. A run with columns the file lacks (an older client's file, or `--qps` columns after a plain run) extends the header and leaves earlier rows blank there, with a warning; code that reads these files by column position should read by name.
 
+3. **Synchronized decode cohorts** (`--cohorts N`, or `COHORTS=N`). Each cohort sends
+   exactly `-u` requests together and waits for every response to drain before sending
+   another cohort. The default `--cohort-warmup 1` completes one additional cohort
+   before recording the new metrics; the run stops after N measured cohorts.
+   Existing per-request metrics, including `latency_per_token`, remain available and
+   include warmup requests. Only the new cohort metrics exclude the warmup cohorts.
+
+   `cohort_decode_lpt` measures the common **client token-arrival** window: T0 is the
+   latest first-token-group arrival, T1 the earliest last-token-group arrival, and
+   N_i(t) the cumulative generated tokens received for request i through t:
+
+   ```text
+   cohort_decode_lpt = 1000 * C * (T1 - T0) / sum_i(N_i(T1) - N_i(T0))  # ms/token
+   ```
+
+   Count whole token groups in `(T0, T1]`, without interpolating within an SSE event.
+   This excludes TTFT and slow tails and avoids replacement-request prefill from this
+   client. It does not guarantee isolation from other traffic, GPU scheduling or the
+   numerical effects of prefill. Compare baseline and candidate under the same mode;
+   a lower number than continuous-load LPT is not itself a speedup.
+   Streaming token IDs adds response bytes and client work; it is not assumed free.
+
+   Requires single-process `--headless --provider fireworks --stream`, fixed `-u`,
+   `-n 1` and constant output length >1. The payload opts into
+   `stream_options.include_internal_content`; the server must emit token IDs in
+   `choices[].delta.internal_content.token_ids` or Moonshot-compatible
+   `choices[].internal_content[].token_ids`. A usage-only final frame, text
+   retokenization or SSE-event counts cannot supply token-arrival progress.
+   Missing IDs/usage, unequal token totals, early EOS, missing DONE, failed requests,
+   insufficient overlap or an interrupted schedule fail the run, without retries.
+   Every request must retain at least `--cohort-min-fraction` of its output (default
+   0.85); `--cohort-timeout` (default 600 s) bounds a cohort and user rendezvous.
+   QPS/burst/ramping/replay/shape-mix/cancellation modes are incompatible.
+
+   Locust metrics and summary CSV add `cohort_decode_lpt` (including percentiles over
+   cohorts), `cohort_window_ms`, `cohort_window_tokens` and
+   `cohort_min_retained_fraction`. The final CSV also records requested/completed
+   cohorts and failures; averages weight cohorts equally. `Decode cohort:` log
+   records retain response IDs and each request's boundary counts. Audit actual
+   prompt/cache usage using the existing metrics; a cache cap alone proves no hit.
+   `-t`, when provided, is still a watchdog: expiry before all cohorts finish marks
+   the run failed. Otherwise completion of the fixed schedule stops it.
+
+   ```bash
+   locust -f load_test.py --headless -H http://127.0.0.1:80 \
+     --provider fireworks --chat --stream --tokenizer /path/to/tokenizer \
+     --dataset code --prompt-tokens 80000 --prompt-cache-max-len 80000 \
+     --max-tokens 600 --max-tokens-distribution constant --temperature 0 --top-k 1 \
+     -u 12 -r 12 --cohorts 3 --cohort-warmup 1 --summary-file cohort.csv --csv cohort
+   ```
+
+   A wrapper that already passes the normal Locust flags can opt in with
+   `COHORTS=3`; ensure its duration allows the warmup plus all measured cohorts.
+   Keep cache preparation/readiness and the benchmark prompt consistent across arms.
+
 ### Workload
 
 Input is read from --dataset, which is either:
