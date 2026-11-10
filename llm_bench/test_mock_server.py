@@ -276,3 +276,102 @@ def test_preflight_tokenizer_check_compares_content_and_blank_boundary_refused(t
     embeddings = ("e", 1, None, None, ["--embeddings"])
     summary.write_text("Num Requests\n10\n")
     assert summary_mismatch(str(summary), embeddings, 128, 0, "tok") is None
+
+
+def test_mock_refuses_a_wrong_length_acceptance_override() -> None:
+    """A-1: the engine refuses an acceptance override whose length differs from its num_draft_tokens (a UserError),
+    so the mock does too -- a schedule padded wider than the replica's draft count otherwise fails only on GPU."""
+    import json as _json
+    import threading
+    import urllib.request
+    from http.server import HTTPServer
+
+    from mock_server import make_handler
+
+    class Engine:
+        def token_ids(self, body):
+            return [1]
+
+        def serve(self, ids, affinity):
+            return 0
+
+    for override, expect in (([0.9, 0.7], 200), ([0.9, 0.7, 0.5], 400), (None, 200)):
+        handler = make_handler(Engine(), 0.0, 0.0, num_draft_tokens=2)
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            body = {"model": "m", "prompt": "x", "max_tokens": 2}
+            if override is not None:
+                body["acceptance_probs_override"] = override
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/completions",
+                data=_json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    assert expect == 200, (override, r.status)
+            except urllib.error.HTTPError as e:
+                assert e.code == expect == 400 and b"must have 2 entries" in e.read()
+        finally:
+            server.shutdown()
+
+
+def test_preflight_passes_the_draft_width_and_refuses_a_mismatch(tmp_path, capsys) -> None:
+    """A-1b: the pre-flight starts ITS OWN mock with --num-draft-tokens <the plan's width>, and checks the
+    schedule's acceptance-list width against it before any step: a mis-width schedule fails at pre-flight, not as
+    every row failing on GPU."""
+    import json
+    import urllib.request
+
+    from preflight_run import main
+
+    mix = (
+        '{"seed":1,"classes":[{"name":"c","weight":1,"prompt_tokens":900,"cached_prompt_tokens":500,'
+        '"generated_tokens":4}]}'
+    )
+    rows = [
+        {
+            "time_s": 0,
+            "class": "c",
+            "input_length": 900,
+            "cached_length": 500,
+            "output_length": 4,
+            "matched_per_pos": [1, 1],
+            "drafted_per_pos": [2, 2],
+        }
+    ]
+    schedule = tmp_path / "s.jsonl"
+    schedule.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    plan = {
+        "record": {"target_qps": 1.0, "num_draft_tokens": 2},
+        "traffic_generator_create_args": {
+            "ramp-1": [
+                "traffic-generator",
+                "create",
+                "--concurrency",
+                "1",
+                "--duration",
+                "5s",
+                "--extra-args",
+                f"--shape-mix '{mix}' --no-chat --replay-schedule {schedule}",
+            ],
+        },
+    }
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    out = tmp_path / "out"
+    assert main([str(path), "--out", str(out), "--window", "0", "--replay-acceptance-per-row"]) == 0
+    text = capsys.readouterr().out
+    assert "num_draft_tokens is 2" in text and "the mock enforces the override width" in text
+    # the mock was started with the width: a wrong-width override would have failed every request
+    assert (out / "mock.requests").exists()
+    # a 3-wide schedule against a 2-wide replica: refused before any step
+    rows3 = [dict(rows[0], drafted_per_pos=[2, 2, 2], matched_per_pos=[1, 1, 1])]
+    schedule.write_text("\n".join(json.dumps(r) for r in rows3) + "\n")
+    out2 = tmp_path / "out2"
+    assert main([str(path), "--out", str(out2), "--window", "0", "--replay-acceptance-per-row"]) == 2
+    assert "refusing: the schedule's acceptance lists are [3] wide" in capsys.readouterr().out
+    assert not (out2 / "mock.requests").exists()
