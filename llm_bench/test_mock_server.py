@@ -276,3 +276,64 @@ def test_preflight_tokenizer_check_compares_content_and_blank_boundary_refused(t
     embeddings = ("e", 1, None, None, ["--embeddings"])
     summary.write_text("Num Requests\n10\n")
     assert summary_mismatch(str(summary), embeddings, 128, 0, "tok") is None
+
+
+def test_preflight_relative_out_resolves_against_the_caller_not_llm_bench(tmp_path) -> None:
+    """D-315: a relative --out must not depend on the child llm_bench's cwd. The child runs with cwd=HERE, so an
+    unresolved relative --out put the step summary under HERE (a dir the runner never made there), the check found
+    nothing, and a step that exited 0 passed silently. The runner resolves --out at startup, and a step that exits
+    0 without its summary row is a refusal naming the path. This runs the real runner (real _locust, real
+    append_summary_row) from a cwd other than HERE with a relative --out: it fails on the unfixed code."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    plan = {
+        "record": {"target_qps": 1.0},
+        "traffic_generator_create_args": {
+            "ramp-1": [
+                "traffic-generator",
+                "create",
+                "--concurrency",
+                "1",
+                "--duration",
+                "8s",
+                "--qps",
+                "1.0",
+                "--extra-args",
+                '--shape-mix \'{"seed":1,"classes":[{"name":"c","weight":1,"prompt_tokens":150,'
+                '"cached_prompt_tokens":50,"generated_tokens":2}]}\' --no-chat --prefix-reuse-overhang 0 '
+                "--prefix-restore-boundary 1",
+            ],
+        },
+    }
+    (caller / "plan.json").write_text(json.dumps(plan))
+    # Relative --out, cwd = the caller (NOT llm_bench's dir): the unfixed runner passes the relative path to the
+    # child, whose cwd is HERE, so the summary lands under HERE and the caller-side check finds nothing.
+    proc = subprocess.run(
+        [sys.executable, os.path.join(here, "preflight_run.py"), "plan.json", "--out", "rel-out", "--window", "0"],
+        cwd=caller,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "LLM_BENCH_TEST_CHILD": "1"},
+    )
+    out = proc.stdout + proc.stderr
+    # The run passes, its summary lands at the CALLER's resolved --out (an absolute path in the output), and
+    # llm_bench's dir never gains a rel-out. On the unfixed code the summary landed under HERE, the check
+    # found nothing, and the run still exited 0 (verified against 4746e4c in this test's review).
+    assert proc.returncode == 0, out[-400:]
+    assert "(1 row(s)" in out and "no summary row to show" not in out, out[-400:]
+    summary = caller / "rel-out" / "ramp-1.summary.csv"
+    assert summary.exists(), out[-400:]
+    assert not (here / "rel-out").exists()
+    import csv
+
+    with open(summary, newline="") as f:
+        assert sum(1 for _ in csv.reader(f)) == 2  # header + this run's row

@@ -214,6 +214,16 @@ def mismatch_message(step, applied: int, expected: int, window: int, mock_chat_h
     )
 
 
+def summary_row_count(path: str):
+    """The file's row count, or None if it can't be read. The run's record: the absolute --out is printed in
+    preflight's own lines, the summary path in the "step summary" line, so the summary's absence has a cause."""
+    try:
+        with open(path, newline="") as f:
+            return sum(1 for _ in csv.reader(f)) - 1
+    except OSError:
+        return None
+
+
 def set_aside(path: str):
     """Move an existing file to <path>.prev (or .prev2, .prev3, ... if taken), never overwriting; the new name, or
     None when there was nothing to move."""
@@ -407,6 +417,9 @@ def main(argv=None) -> int:
         "preflight-check; pass a different command to override.",
     )
     args = parser.parse_args(argv)
+    # The child llm_bench runs with cwd=HERE, so a relative --out would put the step summary under HERE (where it
+    # fails to create the dir) and the check would find nothing. Resolve here, against the caller's cwd.
+    args.out = os.path.abspath(args.out)
 
     with open(args.plan) as f:
         plan = json.load(f)
@@ -525,7 +538,14 @@ def main(argv=None) -> int:
         print(f"preflight: scored step {step[0]} (rate {step[2]}, concurrency {step[1]}, {run_for:.0f} s)")
         start_line = _log_lines(request_log)
         rc = _locust(port, step, args.duration, summary, os.path.join(args.out, f"{step[0]}.log"))
-        print(f"preflight: step summary {summary} (llm_bench exit {rc})")
+        rows = summary_row_count(summary)
+        print(f"preflight: step summary {summary} ({rows} row(s), llm_bench exit {rc})")
+        if rc == 0 and rows is None:
+            print(
+                f"preflight: refusing: step {step[0]} exited 0 without its summary row ({summary}); "
+                f"out={args.out} summary={summary} rows={rows} locust_exit={rc}"
+            )
+            return 2
         if not paths_ok(step, start_line):
             print(summary)
             return 1
@@ -557,7 +577,7 @@ def main(argv=None) -> int:
             # Never a plan verdict: a driver reading only the exit code mustn't take an experiment for a pass
             print(f"preflight: !!! MISMATCH EXPERIMENT: verdict exit {rc} is not a plan result; exiting 3")
             rc = 3
-        print(summary)  # last line: the step summary's path (the check's input)
+        print(f"{summary} ({rows} row(s), exit {rc})")  # last line: the step summary's path (the check's input)
         return rc
     finally:
         server.terminate()
