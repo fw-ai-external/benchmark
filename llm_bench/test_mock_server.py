@@ -327,13 +327,66 @@ def test_preflight_relative_out_resolves_against_the_caller_not_llm_bench(tmp_pa
     out = proc.stdout + proc.stderr
     # The run passes, its summary lands at the CALLER's resolved --out (an absolute path in the output), and
     # llm_bench's dir never gains a rel-out. On the unfixed code the summary landed under HERE, the check
-    # found nothing, and the run still exited 0 (verified against 4746e4c in this test's review).
-    assert proc.returncode == 0, out[-400:]
-    assert "(1 row(s)" in out and "no summary row to show" not in out, out[-400:]
+    # found nothing, and the run still exited 0 (verified against 4746e4c in this test's review). The summary
+    # is checked FIRST so an unfixed failure names the missing file, not a later format assert.
     summary = caller / "rel-out" / "ramp-1.summary.csv"
     assert summary.exists(), out[-400:]
+    assert proc.returncode == 0, out[-400:]
+    assert "(1 row(s)" in out and "no summary row to show" not in out, out[-400:]
+    # The last line is the bare path (tier_runner.mock_preflight reads it and opens it); the evidence line before
+    assert out.strip().splitlines()[-1] == str(summary), out[-400:]
+    assert f"check input {summary} (1 row(s), exit 0)" in out, out[-400:]
     assert not (here / "rel-out").exists()
     import csv
 
     with open(summary, newline="") as f:
         assert sum(1 for _ in csv.reader(f)) == 2  # header + this run's row
+
+
+def test_preflight_refuses_a_step_that_exits_0_without_its_summary_row(tmp_path, capsys) -> None:
+    """The refusal path (D-315): a step whose llm_bench exits 0 but writes no summary row is a failed run, exit 2,
+    naming the expected path and the run record (out=, summary=, rows=, locust_exit=) — never a silent pass."""
+    import json
+    import os
+
+    import preflight_run
+    from preflight_run import main
+
+    plan = {
+        "record": {"target_qps": 1.0},
+        "traffic_generator_create_args": {
+            "ramp-1": [
+                "traffic-generator",
+                "create",
+                "--concurrency",
+                "1",
+                "--duration",
+                "8s",
+                "--qps",
+                "1.0",
+                "--extra-args",
+                "--no-chat",
+            ],
+        },
+    }
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    out_dir = tmp_path / "out"
+
+    def fake_locust(port, step, duration_cap, summary, log):
+        with open(log, "w") as f:
+            f.write("child ran\n")
+        return 0  # exits 0 without writing the summary: the silent-pass shape
+
+    # The mock server still has to start (the runner boots it before the step); patch only the child
+    real_locust = preflight_run._locust
+    preflight_run._locust = fake_locust
+    try:
+        rc = main([str(path), "--out", str(out_dir), "--window", "0", "--duration", "8"])
+    finally:
+        preflight_run._locust = real_locust
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "refusing: step ramp-1 exited 0 without its summary row" in out
+    assert f"out={out_dir}" in out and "rows=None" in out and "locust_exit=0" in out
+    assert not (out_dir / "ramp-1.summary.csv").exists()

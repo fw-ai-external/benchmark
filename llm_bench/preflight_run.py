@@ -577,7 +577,11 @@ def main(argv=None) -> int:
             # Never a plan verdict: a driver reading only the exit code mustn't take an experiment for a pass
             print(f"preflight: !!! MISMATCH EXPERIMENT: verdict exit {rc} is not a plan result; exiting 3")
             rc = 3
-        print(f"{summary} ({rows} row(s), exit {rc})")  # last line: the step summary's path (the check's input)
+        # The last line stays the bare path: tier_runner.mock_preflight takes lines[-1] as the summary's path
+        # and opens it, so anything riding the final line breaks every downstream reader. The evidence (row
+        # count, llm_bench's exit) goes on the line before it.
+        print(f"preflight: check input {summary} ({rows} row(s), exit {rc})")
+        print(summary)  # last line: the step summary's path (the check's input)
         return rc
     finally:
         server.terminate()
