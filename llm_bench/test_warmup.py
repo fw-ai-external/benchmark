@@ -126,9 +126,9 @@ def sent_log(monkeypatch):
     log = []
     post = UnscoredSender.post
 
-    def recording(self, request, one_token=False):
+    def recording(self, request, one_token=False, model=None):
         log.append((request.schedule_row, one_token, request.prompt, time.monotonic()))
-        return post(self, request, one_token)
+        return post(self, request, one_token, model)
 
     monkeypatch.setattr(UnscoredSender, "post", recording)
     return log
@@ -219,7 +219,8 @@ def test_the_workload_files_warmup_block_is_the_default_and_the_cli_overrides_it
     plan = warmup_plan(_run_options(mix, warmup_cap_s=90.0))
     assert (plan.mode, plan.hit_rate, plan.source) == ("target", 0.62, "prod 2026-11-01..07, replica r3")
     with pytest.raises(ValueError, match="--warmup-cap-s"):
-        warmup_plan(_run_options(mix))  # a target needs its cap
+        warmup_plan(_run_options(mix, warmup_hit_rate=0.62))  # an explicit target needs its cap
+    assert warmup_plan(_run_options(mix)) == WarmupPlan()  # the file's block alone is skipped (R6: below)
     assert warmup_plan(_run_options(mix, no_warmup=True)) == WarmupPlan()
     assert warmup_plan(_run_options(mix, warmup_hit_rate=0.4, warmup_cap_s=9.0)).hit_rate == 0.4
     assert warmup_plan(_run_options(mix, warmup_requests=7)).mode == "requests"
@@ -727,7 +728,7 @@ def test_g3_a_better_or_worse_verdict_needs_three_repeats_per_side(tmp_path) -> 
     # with too few repeats "same" and "different" are claims too: every verdict reads inconclusive, the delta stays
     few = compare.compare([one("100")] * 2, [one("101")] * 2, 0.03)[0]
     assert few["verdict"] == "inconclusive (too few repeats)" and few["delta"] == pytest.approx(0.01)
-    zero = lambda v: dict(ident, **{"Requests Failed": v})
+    zero = lambda v: dict(ident, **{"Qps": v})
     assert compare.compare([zero("0")], [zero("9")], 0.03)[0]["verdict"] == "inconclusive (too few repeats)"
 
 
@@ -889,7 +890,7 @@ def test_f4_a_replay_target_needs_no_cap_but_a_shape_mix_one_does(tmp_path) -> N
     options = _run_options(mix, prefix_fill=True)
     assert warmup_plan(options) == WarmupPlan()  # nor does a mix file's block fail the fill run
     with pytest.raises(ValueError, match="--warmup-cap-s"):
-        warmup_plan(_run_options(mix))
+        warmup_plan(_run_options(mix, warmup_hit_rate=0.5))
     with pytest.raises(ValueError, match="could cut B's warm-up"):  # A's cap left on B's command line
         warmup_plan(_run_options(MIX, warmup_requests=7, warmup_cap_s=5.0))
 
@@ -905,7 +906,7 @@ def test_f5_a_lead_in_completes_before_its_sessions_next_row_but_other_sessions_
     timeline = {}
     post = UnscoredSender.post
 
-    def slow(self, request, one_token=False):
+    def slow(self, request, one_token=False, model=None):
         start = time.monotonic()
         if one_token:
             time.sleep(0.4)  # a slow lead-in (the real one is a request to the server)
@@ -1009,7 +1010,7 @@ def test_f9_compare_verdicts(tmp_path, capsys) -> None:
     zero_a = [dict(ident, **{"Requests Failed": "0", "Fail Ratio": "0", "P50 Total Latency": "100"})]
     zero_b = [dict(ident, **{"Requests Failed": "250", "Fail Ratio": "0.025", "P50 Total Latency": "100"})]
     by = {r["metric"]: r for r in compare.compare(zero_a, zero_b, 0.03, min_repeats=1)}
-    assert by["Requests Failed"]["verdict"] == "different" and by["Requests Failed"]["delta"] == 250
+    assert by["Requests Failed"]["verdict"] == "worse" and by["Requests Failed"]["delta"] == 250
     assert by["Requests Failed"]["delta_kind"] == "abs"  # the difference, not a relative change from 0
     assert by["P50 Total Latency"]["verdict"] == "same"
     # a noisy side swallows the delta: not "same"
@@ -1025,7 +1026,7 @@ def test_f9_compare_verdicts(tmp_path, capsys) -> None:
         tmp_path / "b.csv", [{"Delivery Check": "fail", "Delivery Failures": "late-send share 0.2", "Failed": "1"}]
     )
     out = tmp_path / "out.json"
-    assert compare.main(["--a", a, "--b", b, "--json", str(out)]) == 0
+    assert compare.main(["--a", a, "--b", b, "--json", str(out), "--allow-flagged"]) == 0
     printed = capsys.readouterr().out
     assert "!!! B run 1: delivery check failed (late-send share 0.2); exceeded --max-fail-ratio" in printed
     assert json.loads(out.read_text())["flagged_runs"][0]["side"] == "B"
@@ -1159,7 +1160,7 @@ def test_g2_a_burst_after_a_stall_is_not_delivery() -> None:
 def test_g4_the_lead_ins_after_a_cut_go_out_in_schedule_order_one_after_another(monkeypatch, tmp_path) -> None:
     spans = []
 
-    def slow(self, request, one_token=False):
+    def slow(self, request, one_token=False, model=None):
         start = time.monotonic()
         time.sleep(0.15)
         spans.append((request.schedule_row, start, time.monotonic()))
@@ -1482,7 +1483,7 @@ def test_g11_the_reported_hit_rate_is_the_one_the_stop_used(monkeypatch, tmp_pat
     cached = {0: 700, 1: 0}  # row 0 is a hit and completes in time; row 1 is cold and slow, still in flight at the stop
     delay = {0: 0.25, 1: 0.6}
 
-    def fake(self, request, one_token=False):
+    def fake(self, request, one_token=False, model=None):
         time.sleep(delay.get(request.schedule_row, 0.0))
         return (700, cached.get(request.schedule_row, 0))
 
@@ -1496,8 +1497,193 @@ def test_g11_the_reported_hit_rate_is_the_one_the_stop_used(monkeypatch, tmp_pat
 
 
 def test_g11_a_warmup_that_ran_out_of_rows_is_exhausted_and_reports_the_end_rate(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(UnscoredSender, "post", lambda self, request, one_token=False: (700, 100))  # ~14% hits
+    monkeypatch.setattr(
+        UnscoredSender, "post", lambda self, request, one_token=False, model=None: (700, 100)
+    )  # ~14% hits
     plan = WarmupPlan("target", hit_rate=0.95, tolerance=0.02, window_s=0.3, cap_s=None)
     _replay_run(tmp_path, "http://127.0.0.1:9", plan)
     assert Warmup.reason == "exhausted" and Warmup.requests == 5
     assert Warmup.hit_rate == pytest.approx(100 / 700) == pytest.approx(Warmup.hit_rate_end)
+
+
+# --- review round 2 ------------------------------------------------------------------------------------------------
+
+
+def test_r3_identity_is_compared_as_exact_strings_but_the_rate_(tmp_path, capsys) -> None:
+    a, b = _pairs(
+        tmp_path, a_extra=lambda i: {"Request Seed": "3000000000"}, b_extra=lambda i: {"Request Seed": "3000000002"}
+    )
+    assert compare.main(["--a", *a, "--b", *b]) == 2  # isclose called these equal
+    assert "request seed: A 3000000000 vs B 3000000002" in capsys.readouterr().err
+    for column, one, two in [
+        ("Warmup Requests", "100000000000", "100000000001"),
+        ("Workload Sha256", "1" + "0" * 20, "1" + "0" * 19 + "1"),
+        ("Llm Bench Version", "1.0", "1.00"),
+    ]:
+        a, b = _pairs(tmp_path, n=1, a_extra=lambda i: {column: one}, b_extra=lambda i: {column: two})
+        assert compare.main(["--a", *a, "--b", *b]) == 2, column
+    capsys.readouterr()
+    # the target rate is a float: a rounding difference in how it was written is the same rate
+    a, b = _pairs(tmp_path, n=1, a_extra=lambda i: {"Target Qps": "3.0"}, b_extra=lambda i: {"Target Qps": "3"})
+    assert compare.main(["--a", *a, "--b", *b]) == 0
+    a, b = _pairs(tmp_path, n=1, a_extra=lambda i: {"Target Qps": "3.0"}, b_extra=lambda i: {"Target Qps": "3.5"})
+    assert compare.main(["--a", *a, "--b", *b]) == 2
+
+
+def test_r4_failures_are_judged_exactly_pair_by_pair() -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    row = lambda ratio, count: dict(ident, **{"Fail Ratio": ratio, "Requests Failed": count})
+    a = [row("0", "0")] * 3
+    b = [row("0.029", "29")] * 3  # below --min-noise as a fraction: still a failure increase, in both metrics
+    by = {r["metric"]: r for r in compare.compare(a, b, 0.03)}
+    assert by["Fail Ratio"]["verdict"] == "worse" and by["Requests Failed"]["verdict"] == "worse"  # one rule
+    assert by["Fail Ratio"]["noise"] == 0.0 and "exact" in by["Fail Ratio"]["noise_from"]
+    # no failures on either side: same; fewer on B: better; two pairs the one way and one the other: mixed
+    assert {r["metric"]: r["verdict"] for r in compare.compare(a, a, 0.03)}["Requests Failed"] == "same"
+    assert {r["metric"]: r["verdict"] for r in compare.compare(b, a, 0.03)}["Requests Failed"] == "better"
+    mixed = {
+        r["metric"]: r
+        for r in compare.compare(
+            [row("0", "0"), row("0", "5"), row("0", "5")], [row("0", "2"), row("0", "1"), row("0", "1")], 0.03
+        )
+    }
+    assert mixed["Requests Failed"]["verdict"].startswith("mixed (failures up in 1 pair(s), down in 2")
+    # a verdict is a fact even with a single pair: no "too few repeats" over failures
+    assert {r["metric"]: r["verdict"] for r in compare.compare(a[:1], b[:1], 0.03)}["Requests Failed"] == "worse"
+
+
+def test_r4_a_pair_at_zero_does_not_switch_the_whole_metric_to_a_raw_difference() -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    qps = lambda v: dict(ident, **{"Qps": v})
+    # pairs 1 and 3 are +10%; pair 2's baseline is 0 and B's is not: that pair is "different", the others keep their
+    # relative deltas (and their floor), shown as such
+    (result,) = compare.compare([qps("10"), qps("0"), qps("20")], [qps("11"), qps("3"), qps("22")], 0.03)
+    assert result["verdict"] == "different" and result["from_zero_pairs"] == [2]
+    assert result["delta_kind"] == "rel" and result["pair_deltas"] == [pytest.approx(0.1), None, pytest.approx(0.1)]
+    assert result["delta"] == pytest.approx(0.1) and result["noise"] == pytest.approx(0.03)
+    (both_zero,) = compare.compare([qps("0")] * 3, [qps("0")] * 3, 0.03)
+    assert both_zero["verdict"] == "same" and both_zero["pair_deltas"] == [0.0, 0.0, 0.0]
+
+
+def test_r4_flagged_runs_make_compare_exit_3_and_name_them_unless_allowed(tmp_path, capsys) -> None:
+    a, b = _pairs(
+        tmp_path,
+        b_extra=lambda i: {"Delivery Check": "fail", "Delivery Failures": "late-send share 0.2"} if i == 1 else {},
+    )
+    out = tmp_path / "out.json"
+    assert compare.main(["--a", *a, "--b", *b, "--json", str(out)]) == 3
+    captured = capsys.readouterr()
+    assert "B run 2: delivery check failed (late-send share 0.2)" in captured.err and "| metric |" not in captured.out
+    assert json.loads(out.read_text()) == {
+        "compared": False,
+        "flagged_runs": json.loads(out.read_text())["flagged_runs"],
+        "ignored": [],
+    }
+    assert compare.main(["--a", *a, "--b", *b, "--allow-flagged"]) == 0  # compare anyway: flagged in the output
+    assert "!!! B run 2" in capsys.readouterr().out
+    failed, clean = _pairs(tmp_path, a_extra=lambda i: {"Failed": "1"} if i == 0 else {})
+    assert compare.main(["--a", *failed, "--b", *clean]) == 3  # exceeded --max-fail-ratio, on A
+    assert compare.main(["--a", *clean, "--b", *clean]) == 0
+
+
+class _FakeResponse:
+    content = b'{"usage": {"prompt_tokens": 700, "prompt_tokens_details": {"cached_tokens": 0}}}'
+
+    def raise_for_status(self) -> None:
+        pass
+
+
+def _models_posted(monkeypatch) -> list:
+    models = []
+
+    def post(self, url, data=None, headers=None, timeout=None):
+        models.append(json.loads(data)["model"])
+        return _FakeResponse()
+
+    monkeypatch.setattr(load_test.requests.Session, "post", post)
+    return models
+
+
+def test_r5_warmup_requests_pick_lora_adapters_round_robin_and_leave_the_measured_counter_alone(monkeypatch) -> None:
+    models = _models_posted(monkeypatch)
+    before = next(load_test.LLMUser._lora_adapter_counter)
+    plan = WarmupPlan("requests", requests=5, window_s=0.3)
+    options = _run_options(MIX, lora_adapters=("adapter-a", "adapter-b"))
+    ds = _dataset(MIX, tokenizer=WordTokenizer())
+    ds.build_prefixes()
+    run_shape_mix_warmup(SimpleNamespace(host="http://127.0.0.1:9"), options, ds, plan)
+    assert sorted(models) == ["adapter-a"] * 3 + ["adapter-b"] * 2  # round robin, issued in order
+    assert (
+        next(load_test.LLMUser._lora_adapter_counter) == before + 1
+    )  # the measured requests' round robin is untouched
+    models.clear()
+    run_shape_mix_warmup(SimpleNamespace(host="http://127.0.0.1:9"), _run_options(MIX), ds, plan)
+    assert set(models) == {MODEL}  # without adapters the request keeps the model
+
+
+def test_r5_a_replays_warmup_rows_and_lead_ins_pick_adapters_in_schedule_order(monkeypatch, tmp_path) -> None:
+    models = _models_posted(monkeypatch)
+    plan = WarmupPlan("requests", requests=5, window_s=0.3)
+    _replay_run(tmp_path, "http://127.0.0.1:9", plan, lora_adapters=("adapter-a", "adapter-b"))
+    assert len(models) == 6 and set(models) == {"adapter-a", "adapter-b"}  # five warm-up rows and one lead-in
+
+
+def test_r6_a_mixs_warmup_block_alone_never_stops_an_existing_command_line(caplog) -> None:
+    mix = dict(MIX, warmup={"hit_rate": 0.62, "source": "prod"})
+    with caplog.at_level("WARNING", logger="load_test"):
+        assert warmup_plan(_run_options(mix)) == WarmupPlan()  # --qps, no cap: warn and skip
+    assert "warmup block (hit rate 0.62, prod) is not used" in caplog.text and "--warmup-cap-s" in caplog.text
+    assert warmup_plan(_run_options(mix, warmup_cap_s=60.0)).mode == "target"  # with the cap it warms up
+    with pytest.raises(ValueError, match="--warmup-cap-s"):
+        warmup_plan(_run_options(mix, warmup_hit_rate=0.62))  # an explicit flag still requires it
+    load_test.validate_run_options(_run_options(mix, provider="openai"))  # and startup doesn't refuse
+
+
+def test_r7_a_runs_qps_or_cap_that_differs_from_the_pool_sizing_warns_and_is_recorded(caplog, tmp_path) -> None:
+    mix = dict(MIX, warmup={"hit_rate": 0.62, "source": "prod", "sized_for": {"qps": 3.0, "warmup_cap_s": 120.0}})
+    assert parse_shape_mix(json.dumps(mix)).warmup["sized_for"] == {"qps": 3.0, "warmup_cap_s": 120.0}
+    options = _run_options(mix, qps=3.0, warmup_cap_s=120.0)
+    assert load_test.warmup_sized_for_differences(options) == []
+    differences = load_test.warmup_sized_for_differences(_run_options(mix, qps=5.0, warmup_cap_s=60.0))
+    assert differences == ["--qps 5 (the pool was sized for 3)", "--warmup-cap-s 60 (the pool was sized for 120)"]
+    assert load_test.warmup_sized_for_differences(_run_options(mix, qps=5.0, no_warmup=True)) == []
+    assert load_test.warmup_sized_for_differences(_run_options(mix, qps=None)) == []  # a value the run leaves unset
+    assert load_test.warmup_sized_for_differences(_run_options(MIX, qps=5.0)) == []  # older mixes lack the key
+    older = dict(MIX, warmup={"hit_rate": 0.62})
+    assert load_test.warmup_sized_for_differences(_run_options(older, qps=5.0)) == []
+    with pytest.raises(ValueError, match="sized_for.qps must be a positive number"):
+        parse_shape_mix(json.dumps(dict(MIX, warmup={"sized_for": {"qps": -1}})))
+    with caplog.at_level("WARNING", logger="load_test"):
+        load_test.validate_shape_mix_options(
+            argparse.Namespace(
+                **{
+                    **vars(_run_options(mix, qps=5.0, warmup_cap_s=60.0)),
+                    "chat": False,
+                    "tokenizer": None,
+                    "shape_mix_corpus": None,
+                    "prefix_reuse_overhang": 128,
+                }
+            )
+        )
+    assert "--qps 5 (the pool was sized for 3)" in caplog.text and "sized for a different warm-up" in caplog.text
+    # recorded in the summary beside the run's own values
+    summary = _run_options(
+        mix,
+        qps=5.0,
+        warmup_cap_s=60.0,
+        qps_max_lateness=0.5,
+        qps_min_delivered=0.95,
+        max_late_share=0.05,
+        max_fail_ratio=0.01,
+        summary_file=str(tmp_path / "s.csv"),
+        fail_on_delivery=False,
+        embeddings=False,
+        rerank=False,
+        client_in_flight_interval=0,
+    )
+    load_test.InitTracker.logging_params = {}
+    load_test.FixedQPSPacer._instance = None
+    _timeline([0.0, 0.5, 1.0], [0.0, 0.5, 1.0])
+    _fire_quitting(summary, tmp_path, host="http://h:1")
+    (row,) = list(csv.DictReader(open(tmp_path / "s.csv")))
+    assert (row["Warmup Cap S"], row["Warmup Sized For Qps"], row["Warmup Sized For Cap S"]) == ("60.0", "3.0", "120.0")

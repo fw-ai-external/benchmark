@@ -1155,7 +1155,8 @@ def parse_warmup_block(block, where: str, with_rows: bool = False) -> Optional[d
     """A workload file's optional "warmup" block, validated: {"hit_rate": <0..1>, "source": "<text>"}, and for a
     schedule's meta also "rows" (the warm-up rows the schedule carries) and "hit_rate_by_pod" ({"<pod>": <0..1>}).
     `hit_rate` is production's prompt-cache hit rate over the profile's window for one replica; it is omitted when
-    unknown. None when the file has no block."""
+    unknown. An optional `sized_for` ({"qps": ..., "warmup_cap_s": ...}) says what the profile's pool sizing assumed
+    of the warm-up (see warmup_sized_for_differences). None when the file has no block."""
     if block is None:
         return None
     if not isinstance(block, dict):
@@ -1169,6 +1170,19 @@ def parse_warmup_block(block, where: str, with_rows: bool = False) -> Optional[d
     out: dict = {"source": str(block.get("source", ""))}
     if block.get("hit_rate") is not None:
         out["hit_rate"] = rate(block["hit_rate"], "hit_rate")
+    sized_for = block.get("sized_for")
+    if sized_for is not None:
+        # What the profile's pool sizing assumed of the warm-up it will be run with (older files lack it)
+        if not isinstance(sized_for, dict):
+            raise ValueError(f"{where}: 'sized_for' must be an object, got {sized_for!r}")
+        out["sized_for"] = {}
+        for key in ("qps", "warmup_cap_s"):
+            value = sized_for.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"{where}: sized_for.{key} must be a positive number, got {value!r}")
+            out["sized_for"][key] = float(value)
     if with_rows:
         by_pod = block.get("hit_rate_by_pod")
         if by_pod is not None:
@@ -5159,6 +5173,11 @@ def validate_shape_mix_options(options: argparse.Namespace) -> None:
                     f"{pool}" + ("" if pool else " (the class has no shared prefix)")
                 )
     plan = warmup_plan(options)  # a bad warm-up flag or workload block fails here, before anything is built
+    for difference in warmup_sized_for_differences(options):
+        logger.warning(
+            f"!!! {difference}: the workload file's warmup block says its prefix pool was sized for a different "
+            f"warm-up, so the run's cache behaviour may not match the profile's"
+        )
     warm_rows = any(e.warmup for e in schedule)
     if getattr(options, "processes", None) not in (None, 0, 1) and (
         plan.mode != "none" or (warm_rows and not getattr(options, "no_warmup", False))
@@ -5573,11 +5592,35 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     if target is None:
         return WarmupPlan()
     if cap_s is None and not replaying:
-        raise ValueError(
-            f"a warm-up to hit rate {target:g} ({source}) needs --warmup-cap-s, the seconds after which it stops "
-            f"anyway (or --warmup-requests N for a fixed count, or --no-warmup to skip the file's)"
+        if source == "cli":
+            raise ValueError(
+                f"a warm-up to hit rate {target:g} needs --warmup-cap-s, the seconds after which it stops anyway"
+            )
+        # The file's block, not a flag: a mix that gained a warmup block must not stop an existing command line
+        logger.warning(
+            f"--shape-mix's warmup block (hit rate {target:g}, {source}) is not used: warming up to it needs "
+            f"--warmup-cap-s, the seconds after which it stops anyway (or --warmup-requests N for a fixed count)"
         )
+        return WarmupPlan()
     return WarmupPlan("target", hit_rate=target, source=source, **common)
+
+
+def warmup_sized_for_differences(options: argparse.Namespace) -> list[str]:
+    """Where this run's --qps or --warmup-cap-s differs from what the workload file's warmup block says its pool
+    was sized for (sized_for): the pool was sized for a different warm-up. Empty without the key (older files), without
+    a block, with --no-warmup, or where the run leaves the value unset."""
+    if not getattr(options, "shape_mix", None) or getattr(options, "no_warmup", False):
+        return []
+    block = parse_shape_mix(options.shape_mix).warmup
+    sized_for = (block or {}).get("sized_for") or {}
+    differences = []
+    qps, cap = getattr(options, "qps", None), getattr(options, "warmup_cap_s", None)
+    if qps is not None and sized_for.get("qps") is not None and not math.isclose(qps, sized_for["qps"], rel_tol=1e-9):
+        differences.append(f"--qps {qps:g} (the pool was sized for {sized_for['qps']:g})")
+    wanted = sized_for.get("warmup_cap_s")
+    if cap is not None and wanted is not None and not math.isclose(cap, wanted, rel_tol=1e-9):
+        differences.append(f"--warmup-cap-s {cap:g} (the pool was sized for {wanted:g})")
+    return differences
 
 
 class HitRateWindow:
@@ -5684,8 +5727,20 @@ class UnscoredSender:
         self.http.mount("https://", adapter)
         self.failed = 0
         self.errors: list[str] = []
+        self.adapters = tuple(getattr(options, "lora_adapters", ()) or ())
+        self._adapter_index = 0
 
-    def post(self, request: "ShapeRequest", one_token: bool = False) -> Optional[tuple[int, Optional[int]]]:
+    def next_adapter(self) -> Optional[str]:
+        """The --lora-adapters model for the next warm-up request (round robin, as measured requests pick theirs, but
+        counted here: the measured requests' round robin must not depend on how long the warm-up was). Called in the
+        order requests are issued, so a run given the same N picks the same adapters."""
+        model = select_round_robin(self.adapters, self._adapter_index)
+        self._adapter_index += 1
+        return model
+
+    def post(
+        self, request: "ShapeRequest", one_token: bool = False, model: Optional[str] = None
+    ) -> Optional[tuple[int, Optional[int]]]:
         """(prompt tokens, cached tokens or None if unreported) from the response, None when the request failed.
         A warm-up row keeps its generated_tokens (the server's decode load is part of what is warmed up); a lead-in
         only needs its prompt held (max_tokens 1)."""
@@ -5696,6 +5751,8 @@ class UnscoredSender:
                 data.pop(key, None)
         data.pop("stream_options", None)
         data["stream"] = False
+        if model is not None:
+            data["model"] = model  # --lora-adapters: the request warms this adapter's cache
         try:
             response = self.http.post(
                 self.url,
@@ -5790,8 +5847,8 @@ def run_shape_mix_warmup(environment, options: argparse.Namespace, ds: "ShapeMix
     group = gevent.pool.Group()
     Warmup.prompt_tokens = 0
 
-    def send(request: ShapeRequest) -> None:
-        result = sender.post(request)
+    def send(request: ShapeRequest, model: Optional[str]) -> None:
+        result = sender.post(request, model=model)
         if result is not None:
             Warmup.prompt_tokens += result[0]
             window.add(time.monotonic(), *result)
@@ -5813,7 +5870,7 @@ def run_shape_mix_warmup(environment, options: argparse.Namespace, ds: "ShapeMix
             break
         reason = _wait_until(started + pacer.next_offset(), plan, window, started)
         if reason is None:
-            group.spawn(send, ds.warmup_request())
+            group.spawn(send, ds.warmup_request(), sender.next_adapter())
             sent += 1
     group.join()
     _finish_warmup(plan, reason, sent, started, window, sender)
@@ -5852,28 +5909,30 @@ def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDat
     group = gevent.pool.Group()
     Warmup.prompt_tokens = 0
 
-    def warm_send(request: ShapeRequest) -> None:
-        result = sender.post(request)
+    def warm_send(request: ShapeRequest, model: Optional[str]) -> None:
+        result = sender.post(request, model=model)
         if result is not None:
             Warmup.prompt_tokens += result[0]
             window.add(time.monotonic(), *result)
 
-    def lead_send(request: ShapeRequest) -> None:
-        if sender.post(request, one_token=True) is None:
+    def lead_send(request: ShapeRequest, model: Optional[str]) -> None:
+        if sender.post(request, one_token=True, model=model) is None:
             LeadIns.failed += 1
         else:
             LeadIns.sent += 1
 
     lead_chain: dict = {}  # session -> the greenlet of its latest lead-in send
 
-    def after(prior, send, request: ShapeRequest) -> None:
+    def after(prior, send, request: ShapeRequest, model: Optional[str]) -> None:
         if prior is not None:
             prior.join()  # a session's lead-in completes before the session's next row goes out
-        send(request)
+        send(request, model)
 
     def send_lead_in(entry: "ScheduleEntry") -> None:
         if ds.lay_out_replay_row(entry):
-            greenlet = group.spawn(after, lead_chain.get(entry.session), lead_send, ds.replay_request(entry))
+            greenlet = group.spawn(
+                after, lead_chain.get(entry.session), lead_send, ds.replay_request(entry), sender.next_adapter()
+            )
             if entry.session is not None:
                 lead_chain[entry.session] = greenlet
 
@@ -5907,7 +5966,7 @@ def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDat
         held.clear()
         ds.lay_out_replay_row(entry)
         sent += 1
-        group.spawn(after, lead_chain.get(entry.session), warm_send, ds.replay_request(entry))
+        group.spawn(after, lead_chain.get(entry.session), warm_send, ds.replay_request(entry), sender.next_adapter())
     if cut is None:
         for _, lead_in in held:  # the lead-ins after the last warm-up row
             send_lead_in(lead_in)
@@ -5935,7 +5994,7 @@ def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDat
         group.join()
         lead_started = time.monotonic()
         for entry in ds.lay_out_replay_rows(ahead):
-            lead_send(ds.replay_request(entry))
+            lead_send(ds.replay_request(entry), sender.next_adapter())
         LeadIns.seconds = time.monotonic() - lead_started
     LeadIns.skipped = ds.lead_in_skipped
     _finish_warmup(plan, reason, sent, started, window, sender)
@@ -9249,6 +9308,11 @@ def _(environment, **kw):
         entries["measured_hit_rate"] = "" if hit is None else hit
         # Where the run was sent (not part of the workload identity: it is what A and B differ by, unless they share it)
         entries["target_host"] = getattr(environment, "host", "") or ""
+        sized_for = ((parse_shape_mix(environment.parsed_options.shape_mix).warmup) or {}).get("sized_for") or {}
+        cap = getattr(environment.parsed_options, "warmup_cap_s", None)
+        entries["warmup_cap_s"] = "" if cap is None else cap
+        entries["warmup_sized_for_qps"] = sized_for.get("qps", "")
+        entries["warmup_sized_for_cap_s"] = sized_for.get("warmup_cap_s", "")
         entries["workload_sha256"] = workload_sha256(environment.parsed_options)
         entries["workload_options"] = workload_options(environment.parsed_options)
         entries["workload_options_sha256"] = hashlib.sha256(entries["workload_options"].encode()).hexdigest()

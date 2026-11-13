@@ -23,11 +23,15 @@ max(--min-noise, the spread (max - min) of the per-pair deltas). Inside the floo
 over twice --min-noise, when the pairs are too noisy to say ("inconclusive (noisy pairs)"). --min-repeats (3) counts
 pairs; with fewer every verdict reads "inconclusive (too few repeats)", the deltas still reported. A metric that is 0
 on A and not on B reads "different". Each metric's floor and where it came from, and every pair's delta, are reported.
-A run that failed its delivery check or its --max-fail-ratio is flagged in the output (it is still in the figures).
+Failures are judged exactly, pair by pair, with no noise floor: any increase (or decrease) is reported. A run that
+failed its delivery check or its --max-fail-ratio makes compare exit 3 and name the run; --allow-flagged compares
+anyway (the run is flagged in the output and is still in the figures).
+A pair whose baseline is 0 reads "different" for that metric if B is not 0. Identity (seeds, counts, shas, versions,
+option hashes) is compared as exact strings, only the target rate with a tolerance.
 A percentile's floor is at least one bin of the response-time rounding Locust applies (1 ms below 100 ms, 10 below
 1,000, 100 below 10,000, 1,000 above) over the value: 1,500 vs 1,400 ms is one bin, not a change. If A and B were sent
 to the same host (the summaries' Target Host) it warns in every output: B's requests are A's, and they hit the cache
-A filled unless the server was restarted between runs, so it is not a valid A/A. Exit 0 compared, 2 refused, 1 error.
+A filled unless the server was restarted between runs, so it is not a valid A/A. Exit 0 compared, 2 refused, 3 flagged runs (without --allow-flagged), 1 error.
 
 For a trustworthy comparison run at least 3 pairs, alternating A and B, not alongside other load; P99 is the noisiest
 figure.
@@ -93,11 +97,15 @@ def read_rows(paths: list[str], ignored: Optional[list[str]] = None) -> list[dic
     return rows
 
 
-def _same(a: str, b: str) -> bool:
-    try:
-        return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
-    except ValueError:
-        return a == b
+def _same(a: str, b: str, column: str = "") -> bool:
+    """Whether two identity values agree: exactly, as strings (a seed, a count, a sha, a version, an options hash:
+    isclose would call seeds 3000000000 and 3000000002 equal). Only the target rate, a float, takes a tolerance."""
+    if column == "Target Qps":
+        try:
+            return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
+        except ValueError:
+            pass
+    return a.strip() == b.strip()
 
 
 def _option_differences(a: dict[str, str], b: dict[str, str], ignore: tuple = ()) -> str:
@@ -126,7 +134,7 @@ def identity_differences(a: list[dict[str, str]], b: list[dict[str, str]]) -> li
     problems = []
     for column, label in PAIR_IDENTITY:
         for i, (ra, rb) in enumerate(zip(a, b), 1):
-            if not _same(ra.get(column, ""), rb.get(column, "")):
+            if not _same(ra.get(column, ""), rb.get(column, ""), column):
                 problems.append(
                     f"pair {i}: {label}: A {ra.get(column) or '(none)'} vs B {rb.get(column) or '(none)'}"
                     + (" (give B_i the --warmup-requests N_i that A_i printed)" if column == "Warmup Requests" else "")
@@ -141,10 +149,10 @@ def identity_differences(a: list[dict[str, str]], b: list[dict[str, str]]) -> li
     runs = a + b
     for column, label in SHARED_IDENTITY:
         found = [r.get(column, "") for r in runs]
-        if not all(_same(found[0], v) for v in found):
+        if not all(_same(found[0], v, column) for v in found):
             detail = ""
             if column == "Workload Options Sha256":
-                other = next(r for r in runs if not _same(r.get(column, ""), found[0]))
+                other = next(r for r in runs if not _same(r.get(column, ""), found[0], column))
                 detail = _option_differences(runs[0], other, ("request_seed",))
             problems.append(f"{label} differs between runs: {sorted(set(found))}" + (f" ({detail})" if detail else ""))
         elif not found[0] and column in ("Workload Sha256", "Workload Options Sha256", "Llm Bench Version"):
@@ -178,6 +186,32 @@ def _is_percentile(column: str) -> bool:
     return bool(re.match(r"P\d", column))
 
 
+FAILURE_METRICS = ("Fail Ratio", "Requests Failed")  # one rule: any increase is reported, no noise floor
+
+
+def _failure_result(column: str, pairs: list[tuple[float, float]], kind: str) -> dict[str, Any]:
+    """Failures are not judged against a noise floor: a run that failed more requests did, whatever --min-noise says.
+    Each pair is judged on its own (a pair at 0 is no special case); B up in some pairs and down in others is mixed."""
+    deltas = [y - x for x, y in pairs]
+    up, down = sum(d > 0 for d in deltas), sum(d < 0 for d in deltas)
+    if up and down:
+        verdict = f"mixed (failures up in {up} pair(s), down in {down})"
+    else:
+        verdict = "worse" if up else "better" if down else "same"
+    return {
+        "metric": column,
+        "a": sum(x for x, _ in pairs) / len(pairs),
+        "b": sum(y for _, y in pairs) / len(pairs),
+        "delta": sum(deltas) / len(deltas),
+        "delta_kind": "abs",
+        "pair_deltas": deltas,
+        "noise": 0.0,
+        "noise_from": "none (failures are exact)",
+        "verdict": verdict,
+        "pairs": len(pairs),
+    }
+
+
 def compare(
     a: list[dict[str, str]], b: list[dict[str, str]], min_noise: float, min_repeats: int = MIN_REPEATS
 ) -> list[dict[str, Any]]:
@@ -188,25 +222,30 @@ def compare(
         pairs = [(x, y) for x, y in pairs if x is not None and y is not None]
         if not pairs:
             continue
-        if kind == "rel" and any(x == 0 and y != 0 for x, y in pairs):
-            kind = "abs"  # a relative change from 0 means nothing: the difference
-            absolute = True
-        else:
-            absolute = False
-        deltas = [(y - x) if kind == "abs" else ((y - x) / abs(x) if x else 0.0) for x, y in pairs]
-        delta = sum(deltas) / len(deltas)
-        spread = max(deltas) - min(deltas) if len(deltas) > 1 else 0.0
-        noise = 0.0 if absolute else max(spread, min_noise)
+        if column in FAILURE_METRICS:
+            results.append(_failure_result(column, pairs, kind))
+            continue
+        # A pair whose baseline is 0 has no relative change: it is "different" if B is not 0, and the others are
+        # judged as usual (it is not a reason to judge the whole metric by a raw difference)
+        from_zero = [i for i, (x, y) in enumerate(pairs) if kind == "rel" and x == 0 and y != 0]
+        deltas: list[Optional[float]] = [
+            (y - x) if kind == "abs" else (None if (x == 0 and y != 0) else ((y - x) / abs(x) if x else 0.0))
+            for x, y in pairs
+        ]
+        valid = [d for d in deltas if d is not None]
+        delta = sum(valid) / len(valid) if valid else None
+        spread = max(valid) - min(valid) if len(valid) > 1 else 0.0
+        noise = max(spread, min_noise)
         # A percentile is only known to the bin Locust rounded its response times into (1,500 vs 1,400 ms is one bin),
         # so its floor is at least a bin's width over the value
         statistical, bin_floor, bin_ms = noise, 0.0, 0.0
-        if _is_percentile(column) and not absolute:
-            mean_a, mean_b = sum(x for x, _ in pairs) / len(pairs), sum(y for _, y in pairs) / len(pairs)
+        mean_a, mean_b = sum(x for x, _ in pairs) / len(pairs), sum(y for _, y in pairs) / len(pairs)
+        if _is_percentile(column):
             bin_ms = max(bin_width_ms(mean_a), bin_width_ms(mean_b))
             bin_floor = bin_ms / max(min(mean_a, mean_b), 1.0)
             noise = max(noise, bin_floor)
-        if absolute:
-            verdict = "different" if delta else "same"
+        if from_zero:
+            verdict = "different"
         elif abs(delta) <= noise:
             # (the bin floor is quantization, not noise: it widens "same" but never makes the pairs "noisy")
             verdict = "same" if statistical <= 2 * min_noise else "inconclusive (noisy pairs)"
@@ -218,8 +257,8 @@ def compare(
         results.append(
             {
                 "metric": column,
-                "a": sum(x for x, _ in pairs) / len(pairs),
-                "b": sum(y for _, y in pairs) / len(pairs),
+                "a": mean_a,
+                "b": mean_b,
                 "delta": delta,
                 "delta_kind": kind,
                 "pair_deltas": deltas,
@@ -227,17 +266,20 @@ def compare(
                 "noise_from": (
                     f"percentile bin {bin_ms:g} ms"
                     if bin_floor and bin_floor > statistical
-                    else "pair spread" if spread > min_noise and not absolute else "--min-noise"
+                    else "pair spread" if spread > min_noise else "--min-noise"
                 ),
                 "verdict": verdict,
                 "pairs": len(pairs),
+                "from_zero_pairs": [i + 1 for i in from_zero],
             }
         )
     return results
 
 
-def _format_delta(result: dict[str, Any], delta: Optional[float] = None) -> str:
-    delta = result["delta"] if delta is None else delta
+def _format_delta(result: dict[str, Any], delta: Optional[float] = None, pair: bool = False) -> str:
+    delta = delta if pair else result["delta"]
+    if delta is None:
+        return "n/a (A=0)"
     return f"{delta:+.4f}" if result["delta_kind"] == "abs" else f"{100 * delta:+.1f}%"
 
 
@@ -254,6 +296,8 @@ def flagged_runs(side: str, rows: list[dict[str, str]]) -> list[dict[str, Any]]:
             flagged.append({"side": side, "run": n, "reasons": reasons})
     return flagged
 
+
+EXIT_FLAGGED = 3  # runs that failed their delivery check or --max-fail-ratio, without --allow-flagged
 
 SAME_ENDPOINT_WARNING = (
     "same endpoint: B reuses A's cache unless the server was restarted between runs; not a valid A/A"
@@ -339,7 +383,7 @@ def markdown(
     )
     for r in results:
         noise = f"{r['noise']:.4f}" if r["delta_kind"] == "abs" else f"{100 * r['noise']:.1f}%"
-        per_pair = ", ".join(_format_delta(r, d) for d in r["pair_deltas"])
+        per_pair = ", ".join(_format_delta(r, d, pair=True) for d in r["pair_deltas"])
         lines.append(
             f"| {r['metric']} | {r['a']:.4g} | {r['b']:.4g} | {_format_delta(r)} | {noise} ({r['noise_from']}) "
             f"| {r['pairs']} | {per_pair} | {r['verdict']} |"
@@ -358,6 +402,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Instead of comparing: from a baseline's summary CSV(s), print for each pair the flags a later variant "
         "run must use (--request-seed s_i --warmup-requests N_i) and the workload identity it must match; refuses a "
         "file that is not a valid baseline. With --json, machine-readable.",
+    )
+    parser.add_argument(
+        "--allow-flagged",
+        action="store_true",
+        help="Compare even when runs failed their delivery check or --max-fail-ratio (they are flagged in the "
+        "output); without it such runs make compare exit 3 and name them.",
     )
     parser.add_argument(
         "--restarted-between-runs",
@@ -404,8 +454,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             for problem in problems:
                 print(f"  - {problem}", file=sys.stderr)
             return 2
-        results = compare(a, b, args.min_noise, args.min_repeats)
         flagged = flagged_runs("A", a) + flagged_runs("B", b)
+        if flagged and not args.allow_flagged:
+            print(
+                "compare: not comparing: these runs failed their delivery check or --max-fail-ratio, so their "
+                "figures are not a clean data point (--allow-flagged compares anyway):",
+                file=sys.stderr,
+            )
+            for f in flagged:
+                print(f"  - {f['side']} run {f['run']}: {'; '.join(f['reasons'])}", file=sys.stderr)
+            if args.json:
+                with open(args.json, "w") as out:
+                    json.dump({"compared": False, "flagged_runs": flagged, "ignored": ignored}, out, indent=2)
+            return EXIT_FLAGGED
+        results = compare(a, b, args.min_noise, args.min_repeats)
         warnings, notes = warnings_for(a, b, args.restarted_between_runs)
         for warning in warnings:
             print(f"compare: !!! WARNING: {warning}", file=sys.stderr)
