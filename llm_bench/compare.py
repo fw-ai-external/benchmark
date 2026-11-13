@@ -20,13 +20,17 @@ refuses (exit 2) and says which differ. Rows that are not measured runs (a --pre
 
 Else each metric's verdict comes from the paired relative deltas (A_i vs B_i): their mean against a noise floor of
 max(--min-noise, the spread (max - min) of the per-pair deltas). Inside the floor it reads "same", unless the floor is
-over twice --min-noise, when the pairs are too noisy to say ("inconclusive (noisy pairs)"). --min-repeats (3) counts
-pairs; with fewer every verdict reads "inconclusive (too few repeats)", the deltas still reported. A metric that is 0
-on A and not on B reads "different". Each metric's floor and where it came from, and every pair's delta, are reported.
-Failures are judged exactly, pair by pair, with no noise floor: any increase (or decrease) is reported. A run that
-failed its delivery check or its --max-fail-ratio makes compare exit 3 and name the run; --allow-flagged compares
-anyway (the run is flagged in the output and is still in the figures).
-A pair whose baseline is 0 reads "different" for that metric if B is not 0. Identity (seeds, counts, shas, versions,
+over twice --min-noise, when the pairs are too noisy to say ("inconclusive (noisy pairs)"). --min-noise is a relative
+floor for the metrics compared as a relative change and an absolute one (in points) for a fraction such as the hit
+rate. --min-repeats (3) counts the pairs a judgement rests on: with fewer, that judgement reads "inconclusive (too few
+repeats)", the deltas still reported. Failures are the exception: judged exactly, pair by pair, with no noise floor,
+so any increase (or decrease) is reported even with few pairs, labelled "(fact; too few pairs for the noise
+judgement)". A pair whose baseline is 0 is set aside: if B is not 0 there it reads "different" (B higher, with its
+direction), and the other pairs keep their own judgement ("other pairs: ..."); at 0 in both it is left out of the
+statistics ("0 in both"). Each metric's floor and where it came from, and every pair's delta, are reported.
+A run that failed its delivery check or its --max-fail-ratio, had failed warm-up requests or never had its delivery
+checked (the check was off) makes compare exit 3 and name the run; --allow-flagged compares anyway (the run is flagged
+in the output and is still in the figures). --recipe refuses a flagged baseline the same way. Identity (seeds, counts, shas, versions,
 option hashes) is compared as exact strings, only the target rate with a tolerance.
 A percentile's floor is at least one bin of the response-time rounding Locust applies (1 ms below 100 ms, 10 below
 1,000, 100 below 10,000, 1,000 above) over the value: 1,500 vs 1,400 ms is one bin, not a change. If A and B were sent
@@ -229,12 +233,14 @@ def compare(
         if column in FAILURE_METRICS:
             results.append(_failure_result(column, pairs, min_repeats))
             continue
-        # A pair whose baseline is 0 has no relative change: it is "different" if B is not 0, and the others are
-        # judged as usual (it is not a reason to judge the whole metric by a raw difference)
+        # A pair whose baseline is 0 has no relative change. If B is not 0 there it is "different" (and B is higher);
+        # at 0 in both it says nothing and stays out of the statistics. The other pairs are judged as usual, and the
+        # judgement counts only the pairs it judges (--min-repeats of them), not the ones set aside
         from_zero = [i for i, (x, y) in enumerate(pairs) if kind == "rel" and x == 0 and y != 0]
+        both_zero = [i for i, (x, y) in enumerate(pairs) if kind == "rel" and x == 0 and y == 0]
         deltas: list[Optional[float]] = [
-            (y - x) if kind == "abs" else (None if (x == 0 and y != 0) else ((y - x) / abs(x) if x else 0.0))
-            for x, y in pairs
+            None if i in from_zero or i in both_zero else ((y - x) if kind == "abs" else (y - x) / abs(x))
+            for i, (x, y) in enumerate(pairs)
         ]
         valid = [d for d in deltas if d is not None]
         delta = sum(valid) / len(valid) if valid else None
@@ -249,13 +255,15 @@ def compare(
             bin_floor = bin_ms / max(min(mean_a, mean_b), 1.0)
             noise = max(noise, bin_floor)
         if delta is None:
-            judged = "n/a"  # every pair's baseline is 0: no relative change to judge
+            judged = "n/a"  # no pair has a baseline to judge a change against
+        elif len(valid) < min_repeats:
+            # Too few judged pairs can't tell a change from run-to-run noise, and "same" is a claim too
+            judged = "inconclusive (too few repeats)"
         elif abs(delta) <= noise + EPSILON:
             # (the bin floor is quantization, not noise: it widens "same" but never makes the pairs "noisy")
             judged = "same" if statistical <= 2 * min_noise else "inconclusive (noisy pairs)"
         else:
             judged = "better" if (delta > 0) == higher_is_better else "worse"
-        verdict = judged
         if from_zero:
             # B is above a baseline of 0 there (these metrics are not negative): the direction is said, and the
             # other pairs keep their own judgement
@@ -264,9 +272,10 @@ def compare(
                 f"different: {direction} where A was 0 (B higher, pair {', '.join(str(i + 1) for i in from_zero)});"
                 f" other pairs: {judged}"
             )
-        if len(pairs) < min_repeats:
-            # Too few pairs can't tell a change from run-to-run noise, and "same" and "different" are claims too
-            verdict = "inconclusive (too few repeats)"
+        elif delta is None:
+            verdict = "0 in both"
+        else:
+            verdict = judged
         results.append(
             {
                 "metric": column,
@@ -283,7 +292,9 @@ def compare(
                 ),
                 "verdict": verdict,
                 "pairs": len(pairs),
+                "judged_pairs": len(valid),
                 "from_zero_pairs": [i + 1 for i in from_zero],
+                "zero_in_both_pairs": [i + 1 for i in both_zero],
             }
         )
     return results
@@ -297,12 +308,19 @@ def _format_delta(result: dict[str, Any], delta: Optional[float] = None, pair: b
 
 
 def flagged_runs(side: str, rows: list[dict[str, str]]) -> list[dict[str, Any]]:
-    """Runs that did not deliver their traffic or failed too many requests: their figures are not a clean data point."""
+    """Runs whose figures are not a clean data point: they did not deliver their traffic, failed too many requests or
+    warm-up requests, or never had their delivery checked (the check was off, or the summary has none)."""
     flagged = []
     for n, row in enumerate(rows, 1):
         reasons = []
-        if row.get("Delivery Check") == "fail":
+        check = row.get("Delivery Check", "")
+        if check == "fail":
             reasons.append(f"delivery check failed ({row.get('Delivery Failures', '')})")
+        elif check != "pass":
+            reasons.append("delivery unchecked (the run's delivery check was off: run with --fail-on-delivery)")
+        warm_failed = _number(row, "Warmup Failed Requests")
+        if warm_failed:
+            reasons.append(f"{warm_failed:g} warm-up request(s) failed")
         if row.get("Failed") == "1":
             reasons.append(f"exceeded --max-fail-ratio (Fail Ratio {row.get('Fail Ratio', '')})")
         if reasons:
@@ -402,7 +420,10 @@ def markdown(
     )
     for r in results:
         noise = f"{r['noise']:.4f}" if r["delta_kind"] == "abs" else f"{100 * r['noise']:.1f}%"
-        per_pair = ", ".join(_format_delta(r, d, pair=True) for d in r["pair_deltas"])
+        per_pair = ", ".join(
+            "0 in both" if i + 1 in r.get("zero_in_both_pairs", ()) else _format_delta(r, d, pair=True)
+            for i, d in enumerate(r["pair_deltas"])
+        )
         lines.append(
             f"| {r['metric']} | {r['a']:.4g} | {r['b']:.4g} | {_format_delta(r)} | {noise} ({r['noise_from']}) "
             f"| {r['pairs']} | {per_pair} | {r['verdict']} |"
@@ -425,8 +446,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--allow-flagged",
         action="store_true",
-        help="Compare even when runs failed their delivery check or --max-fail-ratio (they are flagged in the "
-        "output); without it such runs make compare exit 3 and name them.",
+        help="Compare (or take a --recipe baseline) even when runs failed their delivery check or --max-fail-ratio, "
+        "had failed warm-up requests, or never had their delivery checked (they are flagged in the output); without "
+        "it such runs make compare exit 3 and name them.",
     )
     parser.add_argument(
         "--restarted-between-runs",
@@ -439,7 +461,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--min-repeats",
         type=int,
         default=MIN_REPEATS,
-        help=f"Pairs needed for a verdict (default {MIN_REPEATS}); fewer reads inconclusive.",
+        help=f"Pairs a judgement needs (default {MIN_REPEATS}); fewer reads inconclusive, except failures, which are "
+        "always reported as a fact.",
     )
     parser.add_argument("--json", default=None, help="Write the comparison here as JSON.")
     parser.add_argument("--markdown", default=None, help="Write the comparison here as a markdown table.")
@@ -447,7 +470,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.recipe is None and not (args.a and args.b):
         parser.error("give --a and --b to compare, or --recipe for a baseline's flags")
     if args.recipe is not None and (args.a or args.b):
-        parser.error("--recipe goes alone")
+        parser.error("--recipe goes alone (with --allow-flagged, if the baseline has flagged runs)")
     try:
         ignored: list[str] = []
         if args.recipe is not None:
@@ -459,6 +482,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             except ValueError as e:
                 print(f"compare: {e}", file=sys.stderr)
                 return 2
+            flagged = flagged_runs("baseline", rows)
+            if flagged and not args.allow_flagged:
+                print(
+                    "compare: not a clean baseline: these runs need a rerun, since a variant is judged against them "
+                    "(--allow-flagged takes them anyway):",
+                    file=sys.stderr,
+                )
+                for f in flagged:
+                    print(f"  - run {f['run']}: {'; '.join(f['reasons'])}", file=sys.stderr)
+                return EXIT_FLAGGED
             if args.json:
                 with open(args.json, "w") as f:
                     json.dump(result, f, indent=2)
@@ -476,8 +509,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         flagged = flagged_runs("A", a) + flagged_runs("B", b)
         if flagged and not args.allow_flagged:
             print(
-                "compare: not comparing: these runs failed their delivery check or --max-fail-ratio, so their "
-                "figures are not a clean data point (--allow-flagged compares anyway):",
+                "compare: not comparing: these runs failed their delivery check or --max-fail-ratio, had failed "
+                "warm-up requests, or never had their delivery checked, so their figures are not a clean data point "
+                "(--allow-flagged compares anyway):",
                 file=sys.stderr,
             )
             for f in flagged:

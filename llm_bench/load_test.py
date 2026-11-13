@@ -1162,7 +1162,7 @@ def _derived_shape_class_name(raw: dict, index: int) -> str:
 
 def parse_warmup_block(block, where: str, with_rows: bool = False) -> Optional[dict]:
     """A workload file's optional "warmup" block, validated: {"hit_rate": <0..1>, "source": "<text>"}, and for a
-    schedule's meta also "rows" (the warm-up rows the schedule carries) and "hit_rate_by_pod" ({"<pod>": <0..1>}).
+    schedule's meta also "rows" (validated, informational) and "hit_rate_by_pod" ({"<pod>": <0..1>}).
     `hit_rate` is production's prompt-cache hit rate over the profile's window for one replica; it is omitted when
     unknown. An optional `sized_for` ({"qps": ..., "warmup_cap_s": ...}) says what the profile's pool sizing assumed
     of the warm-up (see warmup_sized_for_differences). None when the file has no block."""
@@ -1202,7 +1202,7 @@ def parse_warmup_block(block, where: str, with_rows: bool = False) -> Optional[d
         if rows is not None:
             if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
                 raise ValueError(f"{where}: 'rows' must be a non-negative integer, got {rows!r}")
-            out["rows"] = rows
+            # (informational: the schedule's own warm-up rows are counted from its rows, not from the meta)
     return out
 
 
@@ -2937,8 +2937,7 @@ class ShapeMixDataset:
             self._counter += 1
             nonce = self._fill_rng.getrandbits(64)
             variant = self._draw_variant(class_index, self._fill_rng)
-        request = self._render(class_index, prefix_index, nonce, counter, variant, 1)
-        return request
+        return self._render(class_index, prefix_index, nonce, counter, variant, 1)
 
     def _render(
         self, ci, prefix_index, nonce, counter, variant, generated_tokens, tail_tokens=None, warm=False
@@ -4592,6 +4591,9 @@ def idle_rule_gap_cv2(times) -> Optional[float]:
 
 # A window's wall-clock time may exceed its monotonic time by this many seconds before the host is judged to have slept
 CLOCK_STALL_SLACK_S = 5.0
+# Fewest due sends the rate and late-share checks judge: below it one late send is more than the 5% late share
+# (at 6 sends it is 17%), so a low-rate run fails on one event, not on delivery. 30 keeps one late send under 4%.
+DELIVERY_MIN_SENDS = 30
 
 
 def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> tuple[dict[str, Any], list[str]]:
@@ -4629,6 +4631,8 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
         late = sum(1 for i, a in zip(intended, actual) if a - i > max_late)
         late_share = (late + skipped) / (sent + skipped) if sent + skipped else 0.0
     failures = []
+    due_sends = (pacer.sent_rows + pacer.skipped_rows) if replaying and pacer is not None else sent + skipped
+    judged = due_sends >= DELIVERY_MIN_SENDS  # stalls, shifts and failures need no count; the rate and late share do
     minimum = getattr(options, "qps_min_delivered", 0.95)
     elapsed_mono = time.monotonic() - SendTimeline.spawned_monotonic if SendTimeline.spawned_monotonic else 0.0
     # The schedule moves later when the client stalls (a send more than --qps-max-lateness late shifts the rest), and
@@ -4644,16 +4648,16 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
             f"the clock stopped for {stall:.0f} s during the window (the host slept?): the schedule paused, and "
             f"the rows due and the lateness were counted on a clock that did not run"
         )
-    if replaying and due_by_wall and (sent + skipped) < minimum * due_by_wall:
+    if judged and replaying and due_by_wall and (sent + skipped) < minimum * due_by_wall:
         failures.append(f"only {sent + skipped} of {due_by_wall} rows due by the wall clock were sent")
-    if ratio is not None and ratio > 1 / minimum:
+    if judged and ratio is not None and ratio > 1 / minimum:
         failures.append(f"delivered {ratio:.2f}x faster than intended (a burst after a stall is not delivery)")
-    if ratio is not None and ratio < minimum:
+    if judged and ratio is not None and ratio < minimum:
         failures.append(
             f"delivered {delivered:.3f} QPS against {intended_qps:.3f} intended by its schedule "
             f"({ratio:.3f} < {minimum:g})"
         )
-    if late_share > getattr(options, "max_late_share", 0.05):
+    if judged and late_share > getattr(options, "max_late_share", 0.05):
         failures.append(f"late-send share {late_share:.3f} > {getattr(options, 'max_late_share', 0.05):g}")
     if fail_ratio > getattr(options, "max_fail_ratio", 0.01):
         failures.append(f"failed-request share {fail_ratio:.3f} > {getattr(options, 'max_fail_ratio', 0.01):g}")
@@ -4668,6 +4672,11 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
         "clock_stall_s": "" if stall is None else stall,
         "late_send_share": late_share,
         "delivery_check": ("fail" if failures else "pass") if enabled else "off",
+        "delivery_note": (
+            ""
+            if judged
+            else f"too few sends to judge ({due_sends} < {DELIVERY_MIN_SENDS}): rate and late share unchecked"
+        ),
         "delivery_failures": "; ".join(failures),
     }, (failures if enabled else [])
 
@@ -5594,6 +5603,7 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     if count is not None:
         return WarmupPlan("requests", requests=count, source="cli", **common)
     source = "cli"
+    from_flag = target is not None  # where the target came from, not what the file's `source` text says
     if target is None and not getattr(options, "no_warmup", False):
         block = read_replay_meta_warmup(options) if replaying else parse_shape_mix(options.shape_mix).warmup
         if block is not None:
@@ -5616,7 +5626,7 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     if target is None:
         return WarmupPlan()
     if cap_s is None and not replaying:
-        if source == "cli":
+        if from_flag:
             raise ValueError(
                 f"a warm-up to hit rate {target:g} needs --warmup-cap-s, the seconds after which it stops anyway"
             )
@@ -5629,28 +5639,27 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     return WarmupPlan("target", hit_rate=target, source=source, **common)
 
 
-SIZED_FOR_REL_TOL = 1e-6  # the profile stores sized_for values to 6 significant digits
+def _same_to_6_digits(a: float, b: float) -> bool:
+    """Whether two numbers print the same to 6 significant digits (`.6g`): how a profile stores a sized_for value, so
+    the run's own value is compared as that printed text, not by a tolerance a rounding can exceed (7/3 stored as
+    2.33333 is 1.4e-6 off)."""
+    return f"{a:.6g}" == f"{b:.6g}"
 
 
 def warmup_sized_for_differences(options: argparse.Namespace) -> list[str]:
     """Where this run's --qps or --warmup-cap-s differs from what the workload file's warmup block says its pool
     was sized for (sized_for): the pool was sized for a different warm-up. Empty without the key (older files), without
-    a block, with --no-warmup, or where the run leaves the value unset."""
+    a block, with no warm-up asked for, or where the run leaves the value unset."""
     if not getattr(options, "shape_mix", None) or warmup_disabled(options):
         return []
     block = parse_shape_mix(options.shape_mix).warmup
     sized_for = (block or {}).get("sized_for") or {}
     differences = []
     qps, cap = getattr(options, "qps", None), getattr(options, "warmup_cap_s", None)
-    # A converter writes the rate to the 6 significant digits it prints: the comparison tolerates that rounding
-    if (
-        qps is not None
-        and sized_for.get("qps") is not None
-        and not math.isclose(qps, sized_for["qps"], rel_tol=SIZED_FOR_REL_TOL)
-    ):
+    if qps is not None and sized_for.get("qps") is not None and not _same_to_6_digits(qps, sized_for["qps"]):
         differences.append(f"--qps {qps:g} (the pool was sized for {sized_for['qps']:g})")
     wanted = sized_for.get("warmup_cap_s")
-    if cap is not None and wanted is not None and not math.isclose(cap, wanted, rel_tol=SIZED_FOR_REL_TOL):
+    if cap is not None and wanted is not None and not _same_to_6_digits(cap, wanted):
         differences.append(f"--warmup-cap-s {cap:g} (the pool was sized for {wanted:g})")
     return differences
 
@@ -5699,7 +5708,6 @@ class Warmup:
     hit_rate_end: Optional[float] = None  # over the last window once the requests in flight had completed
     target: Optional[float] = None
     failed = 0
-    unreported = 0
 
     @classmethod
     def summary_entries(cls) -> dict[str, Any]:
@@ -5837,7 +5845,7 @@ def _finish_warmup(plan: WarmupPlan, reason: str, sent: int, started: float, win
     # so the reason and the reported rate agree; a warm-up not stopped by a decision reports the end rate
     Warmup.hit_rate = window.stop[0] if window.stop is not None else Warmup.hit_rate_end
     Warmup.target = plan.hit_rate if plan.mode == "target" else None
-    Warmup.failed, Warmup.unreported = sender.failed, window.unreported
+    Warmup.failed = sender.failed
     rate = "n/a" if Warmup.hit_rate is None else f"{Warmup.hit_rate:.3f}"
     logger.info(
         f"Warm-up done ({plan.mode}, reason {reason}): {sent} requests, {Warmup.prompt_tokens} prompt tokens in "

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -541,6 +542,7 @@ def test_a_run_that_did_not_deliver_exits_3_only_with_the_check_on(tmp_path, mon
 
 def _summary(path, rows) -> str:
     base = {
+        "Delivery Check": "pass",
         "Workload Sha256": "abc",
         "Workload Options Sha256": "opts",
         "Request Seed": "11",
@@ -729,7 +731,7 @@ def test_g3_a_better_or_worse_verdict_needs_three_repeats_per_side(tmp_path) -> 
     few = compare.compare([one("100")] * 2, [one("101")] * 2, 0.03)[0]
     assert few["verdict"] == "inconclusive (too few repeats)" and few["delta"] == pytest.approx(0.01)
     zero = lambda v: dict(ident, **{"Qps": v})
-    assert compare.compare([zero("0")], [zero("9")], 0.03)[0]["verdict"] == "inconclusive (too few repeats)"
+    assert compare.compare([zero("0")], [zero("9")], 0.03)[0]["verdict"].startswith("different: better where A was 0")
 
 
 def test_the_summary_carries_the_identity_compare_needs(tmp_path) -> None:
@@ -816,18 +818,18 @@ def test_f1_a_perfectly_delivered_random_run_never_fails_the_rate_check() -> Non
 def test_f1_late_share_and_rate_count_only_the_rows_due_when_the_run_ended() -> None:
     entries = tuple(load_test.ScheduleEntry(offset=i * 0.1, class_index=0, index=i) for i in range(100))
     pacer = ReplayPacer(entries, "s.jsonl")
-    pacer.sent_rows, pacer.late_rows = 20, 3  # -t cut the replay after 20 of 100 rows; 3 of those 20 were late
+    pacer.sent_rows, pacer.late_rows = 40, 6  # -t cut the replay after 40 of 100 rows; 6 of those 40 were late
     options = _run_options(MIX, qps=None, replay_schedule="s.jsonl", qps_min_delivered=0.95, max_late_share=0.05)
     options.max_fail_ratio, options.fail_on_delivery = 0.01, True
-    due = [e.offset for e in entries[:20]]
+    due = [e.offset for e in entries[:40]]
     _timeline(due, due)
     summary, failures = delivery_entries(options, pacer, 0.0)
-    assert summary["late_send_share"] == pytest.approx(0.15)  # of the 20 due, not of the 100 rows
+    assert summary["late_send_share"] == pytest.approx(0.15)  # of the 40 due, not of the 100 rows
     assert len(failures) == 1 and "late-send share" in failures[0]
     # skipped rows were due and did not go out
-    pacer.late_rows, pacer.skipped_rows, SendTimeline.skipped = 0, 5, 5
+    pacer.late_rows, pacer.skipped_rows, SendTimeline.skipped = 0, 10, 10
     summary, failures = delivery_entries(options, pacer, 0.0)
-    assert summary["delivered_over_intended"] == pytest.approx(20 / 25) and any("delivered" in f for f in failures)
+    assert summary["delivered_over_intended"] == pytest.approx(40 / 50) and any("delivered" in f for f in failures)
 
 
 def _rows_with_session_context(second_lead_in_input: int) -> list[dict]:
@@ -1151,8 +1153,8 @@ def test_g2_a_replay_that_sent_a_fraction_of_the_rows_due_by_the_wall_clock_fail
 def test_g2_a_burst_after_a_stall_is_not_delivery() -> None:
     options = _run_options(MIX, qps=2.0, qps_max_lateness=0.5, qps_min_delivered=0.95, max_late_share=0.05)
     options.max_fail_ratio, options.fail_on_delivery = 0.01, True
-    intended = [i / 2 for i in range(21)]  # 10 s of schedule
-    _timeline(intended, [10.0 + i / 5 for i in range(21)])  # sent in 4 s: a backlog released at once
+    intended = [i / 2 for i in range(41)]  # 20 s of schedule
+    _timeline(intended, [20.0 + i / 5 for i in range(41)])  # sent in 8 s: a backlog released at once
     entries, failures = delivery_entries(options, None, 0.0)
     assert entries["delivered_over_intended"] == pytest.approx(2.5)
     assert any("faster than intended" in f for f in failures) and entries["delivery_check"] == "fail"
@@ -1559,13 +1561,16 @@ def test_r4_a_pair_at_zero_does_not_switch_the_whole_metric_to_a_raw_difference(
     qps = lambda v: dict(ident, **{"Qps": v})
     # pairs 1 and 3 are +10%; pair 2's baseline is 0 and B's is not: that pair is "different", the others keep their
     # relative deltas (and their floor), shown as such
-    (result,) = compare.compare([qps("10"), qps("0"), qps("20")], [qps("11"), qps("3"), qps("22")], 0.03)
+    (result,) = compare.compare(
+        [qps("10"), qps("0"), qps("20"), qps("15")], [qps("11"), qps("3"), qps("22"), qps("16.5")], 0.03
+    )
     assert result["verdict"] == "different: better where A was 0 (B higher, pair 2); other pairs: better"
     assert result["from_zero_pairs"] == [2]
-    assert result["delta_kind"] == "rel" and result["pair_deltas"] == [pytest.approx(0.1), None, pytest.approx(0.1)]
+    assert result["delta_kind"] == "rel"
+    assert result["pair_deltas"] == [pytest.approx(0.1), None, pytest.approx(0.1), pytest.approx(0.1)]
     assert result["delta"] == pytest.approx(0.1) and result["noise"] == pytest.approx(0.03)
     (both_zero,) = compare.compare([qps("0")] * 3, [qps("0")] * 3, 0.03)
-    assert both_zero["verdict"] == "same" and both_zero["pair_deltas"] == [0.0, 0.0, 0.0]
+    assert both_zero["verdict"] == "0 in both" and both_zero["delta"] is None
 
 
 def test_r4_flagged_runs_make_compare_exit_3_and_name_them_unless_allowed(tmp_path, capsys) -> None:
@@ -1747,12 +1752,14 @@ def test_s3_a_delta_exactly_at_the_floor_is_not_beyond_it(tmp_path) -> None:
 def test_s3_a_pair_from_zero_reports_the_direction_and_keeps_the_other_pairs_judgement() -> None:
     ident = {c: "1" for c, _ in compare.IDENTITY}
     lat = lambda v: dict(ident, **{"Latency Per Token": v})
-    (result,) = compare.compare([lat("100"), lat("0"), lat("100")], [lat("100"), lat("5"), lat("101")], 0.03)
+    (result,) = compare.compare(
+        [lat("100"), lat("0"), lat("100"), lat("100")], [lat("100"), lat("5"), lat("101"), lat("100")], 0.03
+    )
     assert result["verdict"] == "different: worse where A was 0 (B higher, pair 2); other pairs: same"
     (all_zero,) = compare.compare([lat("0")] * 3, [lat("5")] * 3, 0.03)
     assert all_zero["verdict"] == "different: worse where A was 0 (B higher, pair 1, 2, 3); other pairs: n/a"
     (few,) = compare.compare([lat("0")], [lat("5")], 0.03)
-    assert few["verdict"] == "inconclusive (too few repeats)"
+    assert few["verdict"] == "different: worse where A was 0 (B higher, pair 1); other pairs: n/a"
 
 
 def test_s3_failures_with_few_pairs_stay_a_fact_and_say_so() -> None:
@@ -1814,3 +1821,164 @@ def test_s7_one_helper_reads_the_cached_tokens_of_every_usage() -> None:
     }
     provider = load_test.OpenAIProvider("m", _options(False, systemone=False, rerank=False, embeddings=False))
     assert provider.parse_output_json(chunk).cached_tokens == 3
+
+
+# --- review round 4 ------------------------------------------------------------------------------------------------
+
+
+def test_t1_the_judgement_counts_only_the_pairs_it_judges() -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    qps = lambda v: dict(ident, **{"Qps": v})
+    # two pairs from 0, one judged (10 -> 5): three pairs, but the noise judgement rests on one
+    (result,) = compare.compare([qps("0"), qps("0"), qps("10")], [qps("1"), qps("1"), qps("5")], 0.03)
+    assert result["verdict"] == (
+        "different: better where A was 0 (B higher, pair 1, 2); other pairs: inconclusive (too few repeats)"
+    )
+    assert result["judged_pairs"] == 1 and result["pairs"] == 3
+    # three judged pairs are enough, whatever else is set aside
+    (result,) = compare.compare(
+        [qps("0"), qps("10"), qps("10"), qps("10")], [qps("1"), qps("5"), qps("5"), qps("5")], 0.03
+    )
+    assert result["verdict"].endswith("other pairs: worse") and result["judged_pairs"] == 3
+
+
+def test_t2_a_pair_at_zero_in_both_stays_out_of_the_statistics() -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    qps = lambda v: dict(ident, **{"Qps": v})
+    (result,) = compare.compare(
+        [qps("0")] + [qps("10")] * 4, [qps("0")] + [qps("5")] * 4, 0.03
+    )  # a 0 -> 0 pair read as a 0% delta: a spread of 50% and "noisy"
+    assert result["verdict"] == "worse" and result["noise"] == pytest.approx(0.03)
+    assert (
+        result["zero_in_both_pairs"] == [1] and result["judged_pairs"] == 4 and result["delta"] == pytest.approx(-0.5)
+    )
+    assert result["pair_deltas"][0] is None
+
+
+def test_t2_the_output_shows_a_zero_in_both_pair(tmp_path) -> None:
+    a, b = _pairs(
+        tmp_path,
+        n=4,
+        a_extra=lambda i: {"Qps": "0" if i == 0 else "10"},
+        b_extra=lambda i: {"Qps": "0" if i == 0 else "5"},
+    )
+    md = tmp_path / "out.md"
+    assert compare.main(["--a", *a, "--b", *b, "--markdown", str(md)]) == 0
+    row = next(line for line in md.read_text().splitlines() if line.startswith("| Qps |"))
+    assert "0 in both, -50.0%, -50.0%, -50.0%" in row
+
+
+def test_t3_sized_for_compares_the_six_digit_text() -> None:
+    mix = dict(MIX, warmup={"hit_rate": 0.6, "sized_for": {"qps": float(f"{7 / 3:.6g}"), "warmup_cap_s": 120.0}})
+    # 7/3 stored as 2.33333 is 1.4e-6 off a run's 7/3: a tolerance of 1e-6 called that a difference
+    assert load_test.warmup_sized_for_differences(_run_options(mix, qps=7 / 3, warmup_cap_s=120.0)) == []
+    assert load_test.warmup_sized_for_differences(_run_options(mix, qps=2.33334, warmup_cap_s=120.0)) != []
+    hand = dict(MIX, warmup={"hit_rate": 0.6, "sized_for": {"qps": 2.333333}})  # a hand-written, longer value
+    assert load_test.warmup_sized_for_differences(_run_options(hand, qps=7 / 3)) == []
+
+
+def _flagged_row(**extra):
+    return {"Delivery Check": "pass", **extra}
+
+
+def test_t4_warmup_failures_and_unchecked_runs_are_flagged(tmp_path, capsys) -> None:
+    assert compare.flagged_runs("A", [_flagged_row()]) == []
+    (warm,) = compare.flagged_runs("A", [_flagged_row(**{"Warmup Failed Requests": "3"})])
+    assert warm["reasons"] == ["3 warm-up request(s) failed"]
+    (off,) = compare.flagged_runs("B", [{"Delivery Check": "off"}])
+    assert off["reasons"][0].startswith("delivery unchecked")
+    (missing,) = compare.flagged_runs("B", [{}])
+    assert missing["reasons"][0].startswith("delivery unchecked")  # a summary with no check at all
+    a, b = _pairs(tmp_path, b_extra=lambda i: {"Delivery Check": "off"} if i == 0 else {})
+    assert compare.main(["--a", *a, "--b", *b]) == 3
+    assert "B run 1: delivery unchecked" in capsys.readouterr().err
+    assert compare.main(["--a", *a, "--b", *b, "--allow-flagged"]) == 0
+    a, b = _pairs(tmp_path, a_extra=lambda i: {"Warmup Failed Requests": "2"} if i == 2 else {})
+    assert compare.main(["--a", *a, "--b", *b]) == 3
+    assert "A run 3: 2 warm-up request(s) failed" in capsys.readouterr().err
+
+
+def test_t4_recipe_refuses_a_flagged_baseline_unless_allowed(tmp_path, capsys) -> None:
+    a, _ = _pairs(tmp_path, a_extra=lambda i: {"Delivery Check": "fail", "Delivery Failures": "late"} if i == 1 else {})
+    out = tmp_path / "recipe.json"
+    assert compare.main(["--recipe", *a, "--json", str(out)]) == 3
+    captured = capsys.readouterr()
+    assert "not a clean baseline" in captured.err and "run 2: delivery check failed (late)" in captured.err
+    assert captured.out == "" and not out.exists()
+    assert compare.main(["--recipe", *a, "--allow-flagged"]) == 0
+    assert "pair 2: --request-seed 101 --warmup-requests 51" in capsys.readouterr().out
+    unchecked, _ = _pairs(tmp_path, a_extra=lambda i: {"Delivery Check": "off"})
+    assert compare.main(["--recipe", *unchecked]) == 3  # a baseline whose delivery was never checked
+
+
+def test_t5_a_few_sends_are_too_few_to_judge_the_rate_and_late_share(monkeypatch) -> None:
+    options = _run_options(MIX, qps=0.5, qps_max_lateness=0.5, qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    intended = [i * 2.0 for i in range(6)]  # a 0.5 QPS run: six sends
+    actual = [t + (1.0 if i == 3 else 0.0) for i, t in enumerate(intended)]  # one late send in six: 17%
+    _timeline(intended, actual)
+    entries, failures = delivery_entries(options, None, 0.0)
+    assert failures == [] and entries["delivery_check"] == "pass"
+    assert entries["delivery_note"] == "too few sends to judge (6 < 30): rate and late share unchecked"
+    assert entries["late_send_share"] == pytest.approx(1 / 6)  # still reported
+    # among enough sends the same single late send is judged, and is under the limit; four of 60 are over it
+    intended = [i * 2.0 for i in range(60)]
+    _timeline(intended, [t + (1.0 if i == 3 else 0.0) for i, t in enumerate(intended)])
+    assert delivery_entries(options, None, 0.0)[1] == []
+    _timeline(intended, [t + (1.0 if i in (3, 9, 15, 21) else 0.0) for i, t in enumerate(intended)])
+    entries, failures = delivery_entries(options, None, 0.0)
+    assert entries["delivery_note"] == "" and any("late-send share" in f for f in failures)
+    # stalls and failures still apply with few sends
+    _timeline(intended[:6], intended[:6])
+    SendTimeline.spawned()
+    real = time.time
+    monkeypatch.setattr(load_test.time, "time", lambda: real() + 100.0)
+    assert any("clock stopped" in f for f in delivery_entries(options, None, 0.0)[1])
+    monkeypatch.setattr(load_test.time, "time", real)
+    SendTimeline.reset()
+    _timeline(intended[:6], intended[:6])
+    assert any("failed-request share" in f for f in delivery_entries(options, None, 0.5)[1])
+
+
+def test_t5_a_replays_few_due_rows_are_too_few_to_judge_too() -> None:
+    entries = tuple(load_test.ScheduleEntry(offset=i * 2.0, class_index=0, index=i) for i in range(100))
+    pacer = ReplayPacer(entries, "s.jsonl")
+    pacer.sent_rows, pacer.late_rows = 8, 3
+    options = _run_options(MIX, qps=None, replay_schedule="s.jsonl", qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    due = [e.offset for e in entries[:8]]
+    _timeline(due, due)
+    summary, failures = delivery_entries(options, pacer, 0.0)
+    assert failures == [] and summary["delivery_note"].startswith("too few sends to judge (8 < 30)")
+
+
+def test_t6_the_docs_say_what_the_code_does() -> None:
+    doc = " ".join(compare.__doc__.split())
+    assert 'with fewer every verdict reads "inconclusive' not in doc
+    assert "Failures are the exception" in doc and "relative floor" in doc and "absolute one (in points)" in doc
+    readme = " ".join(open(os.path.join(os.path.dirname(load_test.__file__), "README.md")).read().split())
+    assert "with fewer, every metric reads `inconclusive (too few repeats)`" not in readme
+    assert "absolute, in points, for a fraction such as the hit rate" in readme
+
+
+def test_t7_a_mix_blocks_source_text_cli_is_not_a_command_line_target() -> None:
+    mix = dict(MIX, warmup={"hit_rate": 0.62, "source": "cli"})  # the file's own text happens to read "cli"
+    assert warmup_plan(_run_options(mix)) == WarmupPlan()  # skipped with a warning, not refused
+    plan = warmup_plan(_run_options(mix, warmup_cap_s=60.0))
+    assert plan.mode == "target" and plan.source == "cli"
+    with pytest.raises(ValueError, match="--warmup-cap-s"):  # a real flag still needs the cap
+        warmup_plan(_run_options(mix, warmup_hit_rate=0.62))
+
+
+def test_t8_the_dead_code_is_gone() -> None:
+    assert not hasattr(Warmup, "unreported")
+    source = open(load_test.__file__).read()
+    assert (
+        "request = self._render(class_index, prefix_index, nonce, counter, variant, 1)\n        return request"
+        not in source
+    )
+    # the meta's rows are still validated (and accepted), just not kept
+    block = load_test.parse_warmup_block({"hit_rate": 0.5, "rows": 7}, "meta", True)
+    assert "rows" not in block
+    with pytest.raises(ValueError, match="'rows' must be a non-negative integer"):
+        load_test.parse_warmup_block({"rows": -1}, "meta", True)
