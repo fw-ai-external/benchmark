@@ -187,9 +187,10 @@ def _is_percentile(column: str) -> bool:
 
 
 FAILURE_METRICS = ("Fail Ratio", "Requests Failed")  # one rule: any increase is reported, no noise floor
+EPSILON = 1e-9  # float noise at a floor: +0.03 (0.60 -> 0.63) is exactly at a 0.03 floor, not above it
 
 
-def _failure_result(column: str, pairs: list[tuple[float, float]], kind: str) -> dict[str, Any]:
+def _failure_result(column: str, pairs: list[tuple[float, float]], min_repeats: int) -> dict[str, Any]:
     """Failures are not judged against a noise floor: a run that failed more requests did, whatever --min-noise says.
     Each pair is judged on its own (a pair at 0 is no special case); B up in some pairs and down in others is mixed."""
     deltas = [y - x for x, y in pairs]
@@ -198,6 +199,9 @@ def _failure_result(column: str, pairs: list[tuple[float, float]], kind: str) ->
         verdict = f"mixed (failures up in {up} pair(s), down in {down})"
     else:
         verdict = "worse" if up else "better" if down else "same"
+    if len(pairs) < min_repeats:
+        # A failure count is a fact, reported with any number of pairs; only the noise judgement needs more
+        verdict += " (fact; too few pairs for the noise judgement)"
     return {
         "metric": column,
         "a": sum(x for x, _ in pairs) / len(pairs),
@@ -223,7 +227,7 @@ def compare(
         if not pairs:
             continue
         if column in FAILURE_METRICS:
-            results.append(_failure_result(column, pairs, kind))
+            results.append(_failure_result(column, pairs, min_repeats))
             continue
         # A pair whose baseline is 0 has no relative change: it is "different" if B is not 0, and the others are
         # judged as usual (it is not a reason to judge the whole metric by a raw difference)
@@ -244,13 +248,22 @@ def compare(
             bin_ms = max(bin_width_ms(mean_a), bin_width_ms(mean_b))
             bin_floor = bin_ms / max(min(mean_a, mean_b), 1.0)
             noise = max(noise, bin_floor)
-        if from_zero:
-            verdict = "different"
-        elif abs(delta) <= noise:
+        if delta is None:
+            judged = "n/a"  # every pair's baseline is 0: no relative change to judge
+        elif abs(delta) <= noise + EPSILON:
             # (the bin floor is quantization, not noise: it widens "same" but never makes the pairs "noisy")
-            verdict = "same" if statistical <= 2 * min_noise else "inconclusive (noisy pairs)"
+            judged = "same" if statistical <= 2 * min_noise else "inconclusive (noisy pairs)"
         else:
-            verdict = "better" if (delta > 0) == higher_is_better else "worse"
+            judged = "better" if (delta > 0) == higher_is_better else "worse"
+        verdict = judged
+        if from_zero:
+            # B is above a baseline of 0 there (these metrics are not negative): the direction is said, and the
+            # other pairs keep their own judgement
+            direction = "better" if higher_is_better else "worse"
+            verdict = (
+                f"different: {direction} where A was 0 (B higher, pair {', '.join(str(i + 1) for i in from_zero)});"
+                f" other pairs: {judged}"
+            )
         if len(pairs) < min_repeats:
             # Too few pairs can't tell a change from run-to-run noise, and "same" and "different" are claims too
             verdict = "inconclusive (too few repeats)"
@@ -338,15 +351,21 @@ def recipe(rows: list[dict[str, str]]) -> dict[str, Any]:
     problems += identity_differences(rows, rows)
     if problems:
         raise ValueError("not a valid baseline:\n  - " + "\n  - ".join(dict.fromkeys(problems)))
-    pairs = [
-        {
-            "pair": i,
-            "request_seed": row["Request Seed"],
-            "warmup_requests": row["Warmup Requests"],
-            "flags": f"--request-seed {row['Request Seed']} --warmup-requests {row['Warmup Requests']}",
-        }
-        for i, row in enumerate(rows, 1)
-    ]
+    pairs = []
+    for i, row in enumerate(rows, 1):
+        # A baseline run with no warm-up (mode none) has no count to give: the variant is run with --no-warmup, which
+        # is the same run (--warmup-requests 0 is too, but a replay schedule's own warm-up rows are only dropped by an
+        # explicit request, and "no flag" would replay them)
+        no_warmup = row.get("Warmup Mode") == "none"
+        warm = "--no-warmup" if no_warmup else f"--warmup-requests {row['Warmup Requests']}"
+        pairs.append(
+            {
+                "pair": i,
+                "request_seed": row["Request Seed"],
+                "warmup_requests": None if no_warmup else row["Warmup Requests"],
+                "flags": f"--request-seed {row['Request Seed']} {warm}",
+            }
+        )
     return {"pairs": pairs, "identity": {column: rows[0].get(column, "") for column, _ in SHARED_IDENTITY}}
 
 

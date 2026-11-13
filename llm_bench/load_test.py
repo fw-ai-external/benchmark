@@ -84,6 +84,15 @@ _PROMPT_ESTIMATE_SAMPLES = 16
 _SMALL_PREFIX_PROBE_TOKENS = 32
 
 
+def cached_tokens_from_usage(usage: Optional[dict]) -> Optional[int]:
+    """The cached prompt tokens a response's usage reports (usage.prompt_tokens_details.cached_tokens, or the
+    gateway's cached_input_tokens), None when it reports none. One reading for every path that parses usage."""
+    if not usage:
+        return None
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", usage.get("cached_input_tokens"))
+    return None if cached is None else int(cached)
+
+
 def parse_lora_adapters(value: str) -> tuple[str, ...]:
     adapters = tuple(adapter.strip() for adapter in value.split(",") if adapter.strip())
     if not adapters:
@@ -4664,11 +4673,12 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
 
 
 # Options that change the traffic a run sends (beyond the workload files): two runs only compare if these agree.
-# Not the deployment (--model, --provider, the host) or what only reports
+# Not the deployment (--model, --provider, the host) or what only reports, nor --replay-start-at (an absolute time:
+# it says when a run starts, never what it sends, and would differ between any two runs)
 WORKLOAD_OPTIONS = (
     "replay_pod replay_pods replay_pod_index replay_retime replay_retime_min_parent_gap replay_template_subtraction "
     "replay_pool_prefix replay_late_rows qps qps_distribution qps_cv2 qps_dispersion qps_modulation_window "
-    "shape_mix_corpus shape_mix_instruction shape_mix_output_mode shape_mix_sample_lengths shape_mix_tail_variants "
+    "qps_max_lateness shape_mix_corpus shape_mix_instruction shape_mix_output_mode shape_mix_sample_lengths shape_mix_tail_variants "
     "tokenizer chat chat_head_tokens prefix_popularity_zipf prefix_restore_boundary prefix_reuse_overhang "
     "served_model_config max_tokens max_tokens_cap max_tokens_distribution max_tokens_range prompt_tokens "
     "reasoning_effort temperature top_k n stream ignore_eos force_min_tokens logprobs cancel_rate lora_adapters"
@@ -5179,12 +5189,16 @@ def validate_shape_mix_options(options: argparse.Namespace) -> None:
             f"warm-up, so the run's cache behaviour may not match the profile's"
         )
     warm_rows = any(e.warmup for e in schedule)
-    if getattr(options, "processes", None) not in (None, 0, 1) and (
-        plan.mode != "none" or (warm_rows and not getattr(options, "no_warmup", False))
-    ):
+    distributed = (
+        getattr(options, "processes", None) not in (None, 0, 1)
+        or bool(getattr(options, "master", False))
+        or bool(getattr(options, "worker", False))
+    )
+    if distributed and (plan.mode != "none" or (warm_rows and not warmup_disabled(options))):
         raise ValueError(
-            "--processes N with a warm-up: each process would warm up on its own and no single --warmup-requests N "
-            "reproduces it; run one process, or give B --no-warmup and warm both by another way"
+            "--processes N, --master and --worker with a warm-up: each process would warm up on its own and no "
+            "single --warmup-requests N reproduces it; run one process, or give B --no-warmup and warm both by "
+            "another way"
         )
     overhead = 0
     if options.chat:
@@ -5253,7 +5267,7 @@ def validate_run_options(options: argparse.Namespace, host: Optional[str] = None
         # provider only the /v1/models probe would name comes too late for it)
         if not get("provider") and not (host and provider_from_host(host, bool(get("systemone")))):
             warm_rows = False
-            if get("replay_schedule") and not get("prefix_fill") and not get("no_warmup"):
+            if get("replay_schedule") and not get("prefix_fill") and not warmup_disabled(options):
                 names = tuple(c.name for c in parse_shape_mix(options.shape_mix).classes)
                 warm_rows = any(e.warmup for e in replay_entries(options, names))
             if warmup_plan(options).mode != "none" or warm_rows:
@@ -5529,6 +5543,12 @@ def read_replay_meta_warmup(options: argparse.Namespace) -> Optional[dict]:
     return parse_warmup_block(meta.get("warmup") if isinstance(meta, dict) else None, f"{path}: 'warmup'", True)
 
 
+def warmup_disabled(options: argparse.Namespace) -> bool:
+    """--no-warmup, or an explicit --warmup-requests 0: the run asks for no warm-up (a schedule's warm-up rows are
+    dropped, not replayed)."""
+    return bool(getattr(options, "no_warmup", False)) or getattr(options, "warmup_requests", None) == 0
+
+
 def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     """The run's warm-up: the CLI's (--warmup-hit-rate, or --warmup-requests), else the workload file's "warmup" block
     (the mix file's with --shape-mix, the schedule meta's with --replay-schedule), unless --no-warmup. No flag and no
@@ -5564,9 +5584,13 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     if count is not None and count < 0:
         raise ValueError(f"--warmup-requests must be >= 0, got {count}")
     replaying = bool(getattr(options, "replay_schedule", None))
-    if explicit and not replaying and getattr(options, "qps", None) is None:
+    if explicit and count != 0 and not replaying and getattr(options, "qps", None) is None:
         raise ValueError("--warmup-hit-rate and --warmup-requests send the mix at the run's rate: they need --qps")
     common = dict(tolerance=tolerance, window_s=window_s, cap_s=cap_s)
+    if count == 0:
+        # No warm-up requested (a run that had none, and the one given its recipe, are the same run): mode none, so no
+        # delivery-check default, provider requirement or --processes refusal that the other would not have
+        return WarmupPlan(source="cli", **common)
     if count is not None:
         return WarmupPlan("requests", requests=count, source="cli", **common)
     source = "cli"
@@ -5605,20 +5629,28 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     return WarmupPlan("target", hit_rate=target, source=source, **common)
 
 
+SIZED_FOR_REL_TOL = 1e-6  # the profile stores sized_for values to 6 significant digits
+
+
 def warmup_sized_for_differences(options: argparse.Namespace) -> list[str]:
     """Where this run's --qps or --warmup-cap-s differs from what the workload file's warmup block says its pool
     was sized for (sized_for): the pool was sized for a different warm-up. Empty without the key (older files), without
     a block, with --no-warmup, or where the run leaves the value unset."""
-    if not getattr(options, "shape_mix", None) or getattr(options, "no_warmup", False):
+    if not getattr(options, "shape_mix", None) or warmup_disabled(options):
         return []
     block = parse_shape_mix(options.shape_mix).warmup
     sized_for = (block or {}).get("sized_for") or {}
     differences = []
     qps, cap = getattr(options, "qps", None), getattr(options, "warmup_cap_s", None)
-    if qps is not None and sized_for.get("qps") is not None and not math.isclose(qps, sized_for["qps"], rel_tol=1e-9):
+    # A converter writes the rate to the 6 significant digits it prints: the comparison tolerates that rounding
+    if (
+        qps is not None
+        and sized_for.get("qps") is not None
+        and not math.isclose(qps, sized_for["qps"], rel_tol=SIZED_FOR_REL_TOL)
+    ):
         differences.append(f"--qps {qps:g} (the pool was sized for {sized_for['qps']:g})")
     wanted = sized_for.get("warmup_cap_s")
-    if cap is not None and wanted is not None and not math.isclose(cap, wanted, rel_tol=1e-9):
+    if cap is not None and wanted is not None and not math.isclose(cap, wanted, rel_tol=SIZED_FOR_REL_TOL):
         differences.append(f"--warmup-cap-s {cap:g} (the pool was sized for {wanted:g})")
     return differences
 
@@ -5767,13 +5799,12 @@ class UnscoredSender:
             if len(self.errors) < 3:
                 self.errors.append(repr(e)[:200])
             return None
-        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", usage.get("cached_input_tokens"))
-        return int(usage.get("prompt_tokens") or request.prompt_tokens), None if cached is None else int(cached)
+        return int(usage.get("prompt_tokens") or request.prompt_tokens), cached_tokens_from_usage(usage)
 
 
 def _warmup_stop_reason(plan: WarmupPlan, window: HitRateWindow, started: float) -> Optional[str]:
-    """Why a warm-up stops now: "target" (the last full window's hit rate is within the tolerance of the target) or
-    "cap" (--warmup-cap-s passed), else None."""
+    """Why a warm-up stops now: "target" (the hit rate over the last --warmup-window-s, once the warm-up has run that
+    long, is at least the target minus --warmup-tolerance) or "cap" (--warmup-cap-s passed), else None."""
     now = time.monotonic()
     if plan.mode == "target" and now - started >= plan.window_s:
         rate = window.rate(now)
@@ -5898,7 +5929,7 @@ def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDat
     warm_rows = sum(1 for e in staged if e.warmup)
     LeadIns.rows = sum(1 for e in staged if e.lead_in)
     LeadIns.remainder_rows = sum(1 for e in staged if e.lead_in and (e.cached_length or 0) < (e.input_length or 0))
-    if plan.mode == "none" and not getattr(options, "no_warmup", False):
+    if plan.mode == "none" and not warmup_disabled(options):
         # Rows without a target or a count to cut them: the schedule's own warm-up, all of it
         plan = dataclasses.replace(plan, mode="requests", requests=warm_rows, source="schedule")
     limit = {"requests": plan.requests, "none": 0}.get(plan.mode)  # None: as many as the target needs
@@ -6268,7 +6299,7 @@ class OpenAIProvider(BaseProvider):
                 logprob_tokens=None,
                 completion_tokens=usage.get("output_tokens"),
                 prompt_tokens=usage.get("input_tokens"),
-                cached_tokens=usage.get("cached_input_tokens"),
+                cached_tokens=cached_tokens_from_usage(usage),
             )
 
         if self.parsed_options.rerank:
@@ -6297,13 +6328,12 @@ class OpenAIProvider(BaseProvider):
         # Trailing usage-only SSE chunk (choices absent or empty) — return metadata
         # without trying to extract text from a missing choice.
         if len(data.get("choices", [])) == 0:
-            prompt_tokens_details = (usage or {}).get("prompt_tokens_details") or {}
             return ChunkMetadata(
                 text="",
                 logprob_tokens=None,
                 completion_tokens=usage.get("completion_tokens") if usage else None,
                 prompt_tokens=usage.get("prompt_tokens") if usage else None,
-                cached_tokens=prompt_tokens_details.get("cached_tokens"),
+                cached_tokens=cached_tokens_from_usage(usage),
             )
 
         assert len(data["choices"]) == 1, f"Too many choices {len(data['choices'])}"
@@ -6333,10 +6363,7 @@ class OpenAIProvider(BaseProvider):
         else:
             logprob_tokens = None
 
-        cached_tokens = None
-        if usage:
-            prompt_tokens_details = usage.get("prompt_tokens_details") or {}
-            cached_tokens = prompt_tokens_details.get("cached_tokens", None)
+        cached_tokens = cached_tokens_from_usage(usage)
 
         return ChunkMetadata(
             text=text,
@@ -7199,8 +7226,7 @@ class LLMUser(HttpUser):
             # Parsed here, not through the formatter: its parser follows --stream, while the probe always
             # reads a non-streaming body
             usage = orjson.loads(response.content).get("usage") or {}
-            details = usage.get("prompt_tokens_details") or {}
-            cached = details.get("cached_tokens", usage.get("cached_input_tokens"))
+            cached = cached_tokens_from_usage(usage)
             if cached is None:
                 raise ValueError("the response reports no cached tokens (usage.prompt_tokens_details.cached_tokens)")
             return int(cached), int(usage.get("prompt_tokens") or 0)
@@ -8242,7 +8268,7 @@ def init_parser(parser):
         "--warmup-window-s) is >= R - --warmup-tolerance. With --qps the warm-up is the mix at that rate, drawn from "
         "its own seeded stream (so it is the same on every run with this seed); with --replay-schedule it is the "
         "schedule's warm-up rows, replayed at their recorded times, stopping early once the target is reached. "
-        "Needs --warmup-cap-s. The summary reports the warm-up (Warmup Mode / Reason / Requests ...) and the run "
+        "With --shape-mix --qps it needs --warmup-cap-s (a --replay-schedule's warm-up rows bound it). The summary reports the warm-up (Warmup Mode / Reason / Requests ...) and the run "
         "prints the --warmup-requests N that gives B the same warm-up. Defaults to the workload file's warmup block "
         "(hit_rate) when it has one.",
     )
@@ -8253,8 +8279,9 @@ def init_parser(parser):
         metavar="N",
         help="With --shape-mix: a fixed warm-up of exactly N requests (the first N of the same stream a "
         "--warmup-hit-rate run draws, or the schedule's first N warm-up rows). Mutually exclusive with "
-        "--warmup-hit-rate. Give B the N that A reported, so both get the same warm-up and the same measured "
-        "requests; durations aren't comparable (an open-loop client can fall behind on a slower server).",
+        "--warmup-hit-rate. 0 is no warm-up. Give B the N that A reported (and A's --request-seed), so both get the "
+        "same warm-up and the same measured requests; durations aren't comparable (an open-loop client can fall "
+        "behind on a slower server).",
     )
     parser.add_argument(
         "--warmup-tolerance",
@@ -8287,8 +8314,9 @@ def init_parser(parser):
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Exit 3 when the measured phase did not deliver its traffic: delivered send rate below "
-        "--qps-min-delivered of the target, late-send share above --max-late-share, or failed-request share above "
-        "--max-fail-ratio. Default: on when the run warms up (a warm-up flag or workload block, a schedule's warm-up "
+        "--qps-min-delivered of the rate its own intended schedule had (not the nominal --qps), a burst above its "
+        "inverse, late-send share above --max-late-share, failed-request share above --max-fail-ratio, a clock "
+        "stall or a schedule shifted later by a stalled client (more than max(5 s, 1%% of the window)). Default: on when the run warms up (a warm-up flag or workload block, a schedule's warm-up "
         "rows) and off otherwise, so existing --qps and --replay-schedule runs keep their exit codes; "
         "--no-fail-on-delivery turns it off for a warm-up run.",
     )
@@ -8296,7 +8324,8 @@ def init_parser(parser):
         "--qps-min-delivered",
         type=float,
         default=0.95,
-        help="For --fail-on-delivery: the least delivered / target send rate (default 0.95).",
+        help="For --fail-on-delivery: the least delivered / intended send rate, judged against the run's own intended "
+        "schedule (default 0.95); a rate above 1 / this is a burst after a stall and fails too.",
     )
     parser.add_argument(
         "--max-late-share",

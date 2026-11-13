@@ -969,6 +969,7 @@ def test_f8_the_workload_options_are_reported_and_every_name_is_a_real_option() 
         ("replay_retime", "poisson"),
         ("qps_distribution", "gamma"),
         ("qps_cv2", 4.0),
+        ("qps_max_lateness", 2.0),
         ("qps_dispersion", 3.0),
         ("shape_mix_corpus", "x.txt"),
         ("tokenizer", "other"),
@@ -1043,7 +1044,7 @@ def test_f10_processes_with_a_warmup_is_refused() -> None:
         processes=2,
         warmup_requests=5,
     )
-    with pytest.raises(ValueError, match="--processes N with a warm-up"):
+    with pytest.raises(ValueError, match="--processes N, --master and --worker with a warm-up"):
         load_test.validate_shape_mix_options(options)
     options.warmup_requests, options.processes = None, 2
     load_test.validate_shape_mix_options(options)  # no warm-up: processes as before
@@ -1549,7 +1550,8 @@ def test_r4_failures_are_judged_exactly_pair_by_pair() -> None:
     }
     assert mixed["Requests Failed"]["verdict"].startswith("mixed (failures up in 1 pair(s), down in 2")
     # a verdict is a fact even with a single pair: no "too few repeats" over failures
-    assert {r["metric"]: r["verdict"] for r in compare.compare(a[:1], b[:1], 0.03)}["Requests Failed"] == "worse"
+    few = {r["metric"]: r["verdict"] for r in compare.compare(a[:1], b[:1], 0.03)}["Requests Failed"]
+    assert few == "worse (fact; too few pairs for the noise judgement)"
 
 
 def test_r4_a_pair_at_zero_does_not_switch_the_whole_metric_to_a_raw_difference() -> None:
@@ -1558,7 +1560,8 @@ def test_r4_a_pair_at_zero_does_not_switch_the_whole_metric_to_a_raw_difference(
     # pairs 1 and 3 are +10%; pair 2's baseline is 0 and B's is not: that pair is "different", the others keep their
     # relative deltas (and their floor), shown as such
     (result,) = compare.compare([qps("10"), qps("0"), qps("20")], [qps("11"), qps("3"), qps("22")], 0.03)
-    assert result["verdict"] == "different" and result["from_zero_pairs"] == [2]
+    assert result["verdict"] == "different: better where A was 0 (B higher, pair 2); other pairs: better"
+    assert result["from_zero_pairs"] == [2]
     assert result["delta_kind"] == "rel" and result["pair_deltas"] == [pytest.approx(0.1), None, pytest.approx(0.1)]
     assert result["delta"] == pytest.approx(0.1) and result["noise"] == pytest.approx(0.03)
     (both_zero,) = compare.compare([qps("0")] * 3, [qps("0")] * 3, 0.03)
@@ -1687,3 +1690,127 @@ def test_r7_a_runs_qps_or_cap_that_differs_from_the_pool_sizing_warns_and_is_rec
     _fire_quitting(summary, tmp_path, host="http://h:1")
     (row,) = list(csv.DictReader(open(tmp_path / "s.csv")))
     assert (row["Warmup Cap S"], row["Warmup Sized For Qps"], row["Warmup Sized For Cap S"]) == ("60.0", "3.0", "120.0")
+
+
+# --- review round 3 ------------------------------------------------------------------------------------------------
+
+
+def test_s1_a_count_of_zero_is_no_warmup_so_a_and_its_recipe_make_the_same_run(tmp_path, mock_server, sent_log) -> None:
+    assert warmup_plan(_run_options(MIX, warmup_requests=0)).mode == "none"
+    assert warmup_plan(_run_options(MIX, warmup_requests=0, qps=None)).mode == "none"  # needs no --qps either
+    a = _run_options(MIX, qps=5.0, processes=2, provider=None)  # A: no warm-up flags
+    b = _run_options(MIX, qps=5.0, processes=2, provider=None, warmup_requests=0)  # B: the recipe's flags
+    for options in (a, b):
+        load_test.validate_run_options(options)  # no provider required, --processes allowed: for either
+    Warmup.mode = "none"
+    for options in (a, b):  # and the same delivery-check default
+        on_time = [i / 5 for i in range(30)]
+        _timeline(on_time, on_time)
+        options.max_fail_ratio, options.fail_on_delivery = 0.01, None
+        options.qps_max_lateness, options.qps_min_delivered, options.max_late_share = 0.5, 0.95, 0.05
+        assert delivery_entries(options, None, 0.0)[0]["delivery_check"] == "off"
+    # on a replay with warm-up rows, an explicit zero drops them (as --no-warmup does); it does not replay them all
+    host, _ = mock_server()
+    _replay_run(tmp_path, host, warmup_plan(_run_options(REPLAY_MIX, warmup_requests=0)), warmup_requests=0)
+    assert [row for row, *_ in sent_log] == [6] and Warmup.mode == "none" and Warmup.requests == 0
+
+
+def test_s1_the_recipe_of_a_baseline_without_warmup_omits_the_count(tmp_path, capsys) -> None:
+    a, _ = _pairs(tmp_path, a_extra=lambda i: {"Warmup Mode": "none", "Warmup Requests": "0"})
+    out = tmp_path / "recipe.json"
+    assert compare.main(["--recipe", *a, "--json", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "pair 1: --request-seed 100 --no-warmup" in printed and "--warmup-requests 0" not in printed
+    assert json.loads(out.read_text())["pairs"][0]["warmup_requests"] is None
+    mixed, _ = _pairs(tmp_path, a_extra=lambda i: {"Warmup Mode": "target"})
+    assert compare.main(["--recipe", *mixed]) == 0
+    assert "pair 1: --request-seed 100 --warmup-requests 50" in capsys.readouterr().out
+
+
+def test_s2_sized_for_tolerates_the_converters_six_digit_rounding() -> None:
+    mix = dict(MIX, warmup={"hit_rate": 0.6, "sized_for": {"qps": 3.14159265358979, "warmup_cap_s": 119.999987}})
+    same = _run_options(mix, qps=3.14159, warmup_cap_s=120.0)  # the rate printed to 6 digits; the cap as run
+    assert load_test.warmup_sized_for_differences(same) == []
+    assert len(load_test.warmup_sized_for_differences(_run_options(mix, qps=3.1416, warmup_cap_s=120.0))) == 1
+    assert len(load_test.warmup_sized_for_differences(_run_options(mix, qps=3.14159, warmup_cap_s=119.99))) == 1
+
+
+def test_s3_a_delta_exactly_at_the_floor_is_not_beyond_it(tmp_path) -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    rate = lambda v: dict(ident, **{"Measured Hit Rate": v})
+    (result,) = compare.compare([rate("0.6")] * 3, [rate("0.63")] * 3, 0.03)  # +0.03: 0.63 - 0.6 is 0.03000000000000003
+    assert result["verdict"] == "same"
+    (result,) = compare.compare([rate("0.6")] * 3, [rate("0.64")] * 3, 0.03)
+    assert result["verdict"] == "better"
+
+
+def test_s3_a_pair_from_zero_reports_the_direction_and_keeps_the_other_pairs_judgement() -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    lat = lambda v: dict(ident, **{"Latency Per Token": v})
+    (result,) = compare.compare([lat("100"), lat("0"), lat("100")], [lat("100"), lat("5"), lat("101")], 0.03)
+    assert result["verdict"] == "different: worse where A was 0 (B higher, pair 2); other pairs: same"
+    (all_zero,) = compare.compare([lat("0")] * 3, [lat("5")] * 3, 0.03)
+    assert all_zero["verdict"] == "different: worse where A was 0 (B higher, pair 1, 2, 3); other pairs: n/a"
+    (few,) = compare.compare([lat("0")], [lat("5")], 0.03)
+    assert few["verdict"] == "inconclusive (too few repeats)"
+
+
+def test_s3_failures_with_few_pairs_stay_a_fact_and_say_so() -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    row = lambda n: dict(ident, **{"Requests Failed": n})
+    (result,) = compare.compare([row("0")], [row("4")], 0.03)
+    assert result["verdict"] == "worse (fact; too few pairs for the noise judgement)"
+    (result,) = compare.compare([row("0")] * 3, [row("4")] * 3, 0.03)
+    assert result["verdict"] == "worse"
+
+
+def test_s5_a_warmup_with_distributed_locust_is_refused() -> None:
+    for flag in ("master", "worker", "processes"):
+        with pytest.raises(ValueError, match="--master and --worker with a warm-up"):
+            _distributed(flag, 4 if flag == "processes" else True, warmup_requests=5)
+    _distributed("master", True)  # no warm-up: as before
+    _distributed("master", True, warmup_requests=0)  # and 0 is none
+    _distributed("worker", True, no_warmup=True)
+
+
+def _distributed(flag, value, **overrides):
+    options = argparse.Namespace(
+        shape_mix=json.dumps(MIX),
+        chat=False,
+        tokenizer=None,
+        shape_mix_corpus=None,
+        prefix_reuse_overhang=128,
+        qps=5.0,
+        **{flag: value},
+        **overrides,
+    )
+    load_test.validate_shape_mix_options(options)
+
+
+def test_s6_the_help_strings_describe_the_current_behaviour() -> None:
+    parser = argparse.ArgumentParser()
+    load_test.init_parser(parser)
+    helps = {a.dest: " ".join((a.help or "").split()) for a in parser._actions}
+    assert "Needs --warmup-cap-s" not in helps["warmup_hit_rate"]
+    assert "replay-schedule's warm-up rows bound it" in helps["warmup_hit_rate"]
+    assert "intended schedule" in helps["fail_on_delivery"] and "not the nominal --qps" in helps["fail_on_delivery"]
+    assert "delivered / target" not in helps["qps_min_delivered"] and "intended" in helps["qps_min_delivered"]
+    assert "0 is no warm-up" in helps["warmup_requests"]
+
+
+def test_s7_one_helper_reads_the_cached_tokens_of_every_usage() -> None:
+    read = load_test.cached_tokens_from_usage
+    assert read({"prompt_tokens_details": {"cached_tokens": 7}}) == 7
+    assert read({"cached_input_tokens": 9}) == 9  # the gateway's name
+    assert read({"prompt_tokens_details": {"cached_tokens": 7}, "cached_input_tokens": 9}) == 7
+    assert read({"prompt_tokens_details": {}}) is None and read({}) is None and read(None) is None
+    assert read({"prompt_tokens_details": None}) is None
+    # every path takes it from there: the details key is read nowhere else
+    source = open(load_test.__file__).read()
+    assert source.count('.get("cached_tokens"') == 1
+    chunk = {
+        "choices": [],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1, "prompt_tokens_details": {"cached_tokens": 3}},
+    }
+    provider = load_test.OpenAIProvider("m", _options(False, systemone=False, rerank=False, embeddings=False))
+    assert provider.parse_output_json(chunk).cached_tokens == 3
