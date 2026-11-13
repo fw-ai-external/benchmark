@@ -490,16 +490,18 @@ def test_a_replays_late_row_share_and_rate_come_from_its_pacer() -> None:
     assert len(failures) == 1 and "late-send share" in failures[0]
 
 
-def _fire_quitting(options, tmp_path) -> int:
+def _fire_quitting(options, tmp_path, host=None, scored=True) -> int:
     """Run the quitting listener on an environment whose requests all succeeded; the process exit code it sets."""
     from locust.env import Environment
     from locust.stats import RequestStats
 
     environment = Environment(user_classes=[])
     environment.parsed_options = options
+    environment.host = host
     environment.stats = RequestStats()
-    environment.stats.log_request("METRIC", "total_latency", 100, 0)
-    environment.stats.log_request("POST", "/v1/completions", 100, 10)
+    if scored:
+        environment.stats.log_request("METRIC", "total_latency", 100, 0)
+        environment.stats.log_request("POST", "/v1/completions", 100, 10)
     load_test.events.quitting.fire(environment=environment)
     return environment.process_exit_code
 
@@ -646,13 +648,13 @@ def test_r1_verdicts_come_from_the_paired_deltas(tmp_path) -> None:
     """Runs differ a lot from pair to pair (100, 200, 300) but B is 10% above A in each: a per-side spread would call
     that noise; paired, the change is plain."""
     ident = {c: "1" for c, _ in compare.IDENTITY}
-    a = [dict(ident, **{"P50 Total Latency": v}) for v in ("100", "200", "300")]
-    b = [dict(ident, **{"P50 Total Latency": v}) for v in ("110", "220", "330")]
+    a = [dict(ident, **{"Latency Per Token": v}) for v in ("100", "200", "300")]
+    b = [dict(ident, **{"Latency Per Token": v}) for v in ("110", "220", "330")]
     (result,) = compare.compare(a, b, 0.03)
     assert result["verdict"] == "worse" and result["pairs"] == 3 and result["noise_from"] == "--min-noise"
     assert result["pair_deltas"] == pytest.approx([0.1, 0.1, 0.1]) and result["delta"] == pytest.approx(0.1)
     # pairs that disagree set the floor: the spread of the per-pair deltas
-    b = [dict(ident, **{"P50 Total Latency": v}) for v in ("110", "200", "360")]  # +10%, 0%, +20%
+    b = [dict(ident, **{"Latency Per Token": v}) for v in ("110", "200", "360")]  # +10%, 0%, +20%
     (result,) = compare.compare(a, b, 0.03)
     assert result["noise"] == pytest.approx(0.2) and result["noise_from"] == "pair spread"
     assert result["verdict"] == "inconclusive (noisy pairs)"
@@ -714,7 +716,7 @@ def test_compare_reports_deltas_against_the_noise_floor(tmp_path, capsys) -> Non
 
 def test_g3_a_better_or_worse_verdict_needs_three_repeats_per_side(tmp_path) -> None:
     ident = {c: "1" for c, _ in compare.IDENTITY}
-    one = lambda v: dict(ident, **{"P90 Time To First Token": v})
+    one = lambda v: dict(ident, **{"Latency Per Token": v})
     for repeats in (1, 2):
         verdicts = compare.compare([one("100")] * repeats, [one("110")] * repeats, 0.03)
         assert verdicts[0]["verdict"] == "inconclusive (too few repeats)", repeats
@@ -1011,9 +1013,9 @@ def test_f9_compare_verdicts(tmp_path, capsys) -> None:
     assert by["Requests Failed"]["delta_kind"] == "abs"  # the difference, not a relative change from 0
     assert by["P50 Total Latency"]["verdict"] == "same"
     # a noisy side swallows the delta: not "same"
-    noisy = [dict(ident, **{"P50 Total Latency": v}) for v in ("100", "160")]
-    steady = [dict(ident, **{"P50 Total Latency": v}) for v in ("131", "132")]
-    verdict = {r["metric"]: r for r in compare.compare(noisy, steady, 0.03, min_repeats=2)}["P50 Total Latency"][
+    noisy = [dict(ident, **{"Latency Per Token": v}) for v in ("100", "160")]
+    steady = [dict(ident, **{"Latency Per Token": v}) for v in ("131", "132")]
+    verdict = {r["metric"]: r for r in compare.compare(noisy, steady, 0.03, min_repeats=2)}["Latency Per Token"][
         "verdict"
     ]
     assert verdict == "inconclusive (noisy pairs)"
@@ -1211,3 +1213,179 @@ def test_g5_a_replays_shifted_schedule_fails_too() -> None:
     _timeline(sent, sent)
     assert pacer.resync(0, 30.0)
     assert any("schedule moved 30.0 s later" in f for f in delivery_entries(options, pacer, 0.0)[1])
+
+
+# --- fix round 4 ---------------------------------------------------------------------------------------------------
+
+
+def test_g7_the_bin_widths_are_locusts_rounding() -> None:
+    """compare's bins are the ones Locust rounds response times into: confirmed against the installed Locust."""
+    from locust.stats import StatsEntry
+
+    entry = StatsEntry(None, "x", "GET")
+    for value in range(1, 30000):
+        entry._log_response_time(value)
+    keys = sorted(entry.response_times)
+    for low, high in ((1, 99), (200, 990), (1100, 9900), (11000, 29000)):
+        inside = [k for k in keys if low <= k <= high]
+        gaps = {b - a for a, b in zip(inside, inside[1:])}
+        assert gaps == {compare.bin_width_ms(low)}, (low, gaps)  # the keys are one bin apart there
+
+
+def _tail_pairs(tmp_path, column, a_value, b_value):
+    a, b = _pairs(tmp_path, a_extra=lambda i: {column: str(a_value + i)}, b_extra=lambda i: {column: str(b_value + i)})
+    out = tmp_path / "out.json"
+    assert compare.main(["--a", *a, "--b", *b, "--json", str(out)]) == 0
+    return {m["metric"]: m for m in json.loads(out.read_text())["metrics"]}[column]
+
+
+def test_g7_a_percentile_one_bin_apart_is_not_a_change(tmp_path) -> None:
+    # P90 TTFT 1500 vs 1400: one 100 ms bin; the floor is at least a bin over the value (about 7%), not 3%
+    result = _tail_pairs(tmp_path, "P90 Time To First Token", 1500, 1400)
+    assert result["verdict"] == "same" and result["noise_from"] == "percentile bin 100 ms"
+    assert result["noise"] == pytest.approx(100 / 1400, rel=0.01)
+    # two bins apart is a change; the floor is reported
+    assert _tail_pairs(tmp_path, "P90 Time To First Token", 1500, 1200)["verdict"] == "better"
+    # below 100 ms the bin is 1 ms: a 10% change at 50 ms is a change
+    assert _tail_pairs(tmp_path, "P50 Total Latency", 50, 55)["verdict"] == "worse"
+    # what is not a percentile has no bin
+    assert _tail_pairs(tmp_path, "Latency Per Token", 1500, 1400)["verdict"] == "better"
+
+
+def test_g8_the_summary_records_the_target_host(tmp_path) -> None:
+    options = _run_options(
+        MIX,
+        qps=2.0,
+        qps_max_lateness=0.5,
+        qps_min_delivered=0.95,
+        max_late_share=0.05,
+        max_fail_ratio=0.01,
+        summary_file=str(tmp_path / "summary.csv"),
+        fail_on_delivery=False,
+        embeddings=False,
+        rerank=False,
+        client_in_flight_interval=0,
+    )
+    load_test.InitTracker.logging_params = {}
+    load_test.FixedQPSPacer._instance = None
+    _timeline([0.0, 0.5, 1.0], [0.0, 0.5, 1.0])
+    _fire_quitting(options, tmp_path, host="http://server-a:8000")
+    (row,) = list(csv.DictReader(open(tmp_path / "summary.csv")))
+    assert row["Target Host"] == "http://server-a:8000"
+    assert "Target Host" not in {c for c, _ in compare.IDENTITY}  # what A and B differ by: not the workload
+
+
+SAME_ENDPOINT = "same endpoint: B reuses A's cache unless the server was restarted between runs; not a valid A/A"
+
+
+def test_g8_compare_warns_loudly_when_both_sides_hit_one_host(tmp_path, capsys) -> None:
+    host = lambda i: {"Target Host": "http://Server-A:8000/"}
+    a, b = _pairs(tmp_path, a_extra=host, b_extra=lambda i: {"Target Host": "http://server-a:8000"})
+    out, md = tmp_path / "out.json", tmp_path / "out.md"
+    assert compare.main(["--a", *a, "--b", *b, "--json", str(out), "--markdown", str(md)]) == 0
+    captured = capsys.readouterr()
+    assert SAME_ENDPOINT in captured.err and SAME_ENDPOINT in captured.out  # in every output
+    assert SAME_ENDPOINT in md.read_text()
+    assert SAME_ENDPOINT in json.loads(out.read_text())["warnings"][0]
+    # two servers: nothing to warn about
+    a, b = _pairs(tmp_path, a_extra=host, b_extra=lambda i: {"Target Host": "http://server-b:8000"})
+    assert compare.main(["--a", *a, "--b", *b, "--json", str(out), "--markdown", str(md)]) == 0
+    captured = capsys.readouterr()
+    assert "same endpoint" not in captured.err + captured.out + md.read_text()
+    assert json.loads(out.read_text())["warnings"] == []
+
+
+def _validate(**overrides):
+    options = argparse.Namespace(
+        shape_mix=json.dumps(MIX), qps=None, burst=None, ramping_time=None, provider=None, num_users=None
+    )
+    for name, value in overrides.items():
+        setattr(options, name, value)
+    host = options.__dict__.pop("host", None)
+    load_test.validate_run_options(options, host)
+
+
+def test_g9_a_warmup_without_a_provider_fails_at_init_not_after_the_prefix_build() -> None:
+    with pytest.raises(ValueError, match="a warm-up needs --provider"):
+        _validate(qps=5.0, warmup_requests=10)
+    with pytest.raises(ValueError, match="a warm-up needs --provider"):
+        _validate(qps=5.0, warmup_hit_rate=0.5, warmup_cap_s=30.0)
+    _validate(qps=5.0, warmup_requests=10, provider="openai")
+    _validate(qps=5.0, warmup_requests=10, host="https://api.fireworks.ai")  # the host names it
+    _validate(qps=5.0)  # no warm-up: no provider needed here
+    _validate(qps=5.0, warmup_requests=10, provider="openai", no_warmup=True)
+
+
+def test_g9_a_replay_with_warmup_rows_needs_the_provider_but_lead_ins_alone_do_not(tmp_path) -> None:
+    def schedule(rows):
+        path = tmp_path / "s.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        return str(path)
+
+    options = dict(shape_mix=json.dumps(REPLAY_MIX), replay_pods=1, replay_pod_index=0)
+    warm = [_row(-1.0, "s1", 700, 400, warmup=True), _row(0.0, "s1", 900, 700)]
+    with pytest.raises(ValueError, match="a warm-up needs --provider"):
+        _validate(replay_schedule=schedule(warm), **options)
+    _validate(replay_schedule=schedule(warm), no_warmup=True, **options)
+    lead_in = [_row(-1.0, "s1", 700, 400, lead_in=True), _row(0.0, "s1", 900, 700)]
+    _validate(replay_schedule=schedule(lead_in), **options)  # as before: only a warning when they can't be sent
+
+
+def test_g9_the_option_checks_the_users_made_late_now_fail_at_init() -> None:
+    with pytest.raises(ValueError, match="--replay-schedule needs --shape-mix"):
+        _validate(shape_mix=None, replay_schedule="s.jsonl")
+    with pytest.raises(ValueError, match="drop --qps, --burst and --ramping-time"):
+        _validate(replay_schedule="s.jsonl", qps=3.0)
+    with pytest.raises(ValueError, match="--prefix-fill needs --shape-mix"):
+        _validate(shape_mix=None, prefix_fill=True)
+    with pytest.raises(ValueError, match="--prefix-fill sends at"):
+        _validate(prefix_fill=True, qps=3.0)
+    with pytest.raises(ValueError, match="--prefix-fill-concurrency"):
+        _validate(prefix_fill=True, prefix_fill_concurrency=0)
+    with pytest.raises(ValueError, match="standalone"):
+        _validate(prefix_reuse_probe=True, qps=3.0)
+    with pytest.raises(ValueError, match="Burst and QPS"):
+        _validate(qps=3.0, burst=5.0)
+    with pytest.raises(ValueError, match="Burst and ramping"):
+        _validate(ramping_time=5.0, burst=5.0)
+    with pytest.raises(ValueError, match="requires -u"):
+        _validate(ramping_time=5.0)
+    with pytest.raises(ValueError, match="--qps-cv2 must be > 0"):  # the pacer's own check, built early
+        _validate(qps=3.0, qps_distribution="gamma", qps_cv2=-1.0)
+    with pytest.raises(ValueError, match="--shape-mix builds its own prompts"):
+        _validate(dataset="other")
+    with pytest.raises(ValueError, match="-pcml"):
+        _validate(prompt_cache_max_len=10)
+
+
+def test_g9_the_init_listener_exits_before_anything_is_built(caplog) -> None:
+    options = argparse.Namespace(shape_mix=json.dumps(MIX), qps=5.0, provider=None, warmup_requests=10)
+    with caplog.at_level("ERROR", logger="load_test"), pytest.raises(SystemExit):
+        load_test._validate_run_options_on_init(SimpleNamespace(parsed_options=options, host="http://x:8000"))
+    assert "a warm-up needs --provider" in caplog.text
+
+
+def test_g10_the_probe_prints_the_flags_and_exits_0_when_it_measured_something(tmp_path, monkeypatch, capsys) -> None:
+    probe = load_test.PrefixReuseProbe
+    monkeypatch.setattr(probe, "points", [(1000, 872), (2000, 1872)])
+    monkeypatch.setattr(probe, "overhang", 128)
+    monkeypatch.setattr(probe, "boundary", 0)
+    monkeypatch.setattr(probe, "failed", 0)
+    assert load_test.prefix_reuse_probe_flags() == "--prefix-reuse-overhang 128"
+    monkeypatch.setattr(probe, "boundary", 2048)
+    assert load_test.prefix_reuse_probe_flags() == "--prefix-reuse-overhang 128 --prefix-restore-boundary 2048"
+    assert (
+        load_test.prefix_reuse_probe_entries()["prefix_reuse_probe_suggested"] == load_test.prefix_reuse_probe_flags()
+    )
+    options = _run_options(MIX, qps=None, prefix_reuse_probe=True, summary_file=None, embeddings=False, rerank=False)
+    options.max_fail_ratio = 0.01
+    monkeypatch.setattr(load_test.InitTracker, "logging_params", {})
+    assert _fire_quitting(options, tmp_path, scored=False) == 0  # no scored request, by design: not a failure
+    monkeypatch.setattr(probe, "points", [])  # measured nothing
+    assert _fire_quitting(options, tmp_path, scored=False) == 1
+    monkeypatch.setattr(probe, "points", [(1000, 872)])
+    monkeypatch.setattr(probe, "failed", 1)  # a failed measurement
+    assert _fire_quitting(options, tmp_path, scored=False) == 1
+    options.prefix_reuse_probe = False  # any other run with no scored request is still a failure
+    monkeypatch.setattr(probe, "failed", 0)
+    assert _fire_quitting(options, tmp_path, scored=False) == 1

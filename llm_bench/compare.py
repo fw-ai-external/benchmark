@@ -18,7 +18,10 @@ over twice --min-noise, when the pairs are too noisy to say ("inconclusive (nois
 pairs; with fewer every verdict reads "inconclusive (too few repeats)", the deltas still reported. A metric that is 0
 on A and not on B reads "different". Each metric's floor and where it came from, and every pair's delta, are reported.
 A run that failed its delivery check or its --max-fail-ratio is flagged in the output (it is still in the figures).
-Exit 0 compared, 2 refused, 1 error.
+A percentile's floor is at least one bin of the response-time rounding Locust applies (1 ms below 100 ms, 10 below
+1,000, 100 below 10,000, 1,000 above) over the value: 1,500 vs 1,400 ms is one bin, not a change. If A and B were sent
+to the same host (the summaries' Target Host) it warns in every output: B's requests are A's, and they hit the cache
+A filled unless the server was restarted between runs, so it is not a valid A/A. Exit 0 compared, 2 refused, 1 error.
 
 For a trustworthy comparison run at least 3 pairs, alternating A and B, not alongside other load; P99 is the noisiest
 figure.
@@ -28,6 +31,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
 from typing import Any, Optional
 
@@ -153,6 +157,21 @@ def _number(row: dict[str, str], column: str) -> Optional[float]:
 MIN_REPEATS = 3  # a verdict needs this many pairs
 
 
+def bin_width_ms(value_ms: float) -> float:
+    """The width of the bin Locust stores a response time of `value_ms` in: it keeps response times rounded, exact below
+    100 ms, to 10 below 1,000, to 100 below 10,000 and to 1,000 above (stats.py, StatsEntry._log_response_time), so a
+    percentile is only known to a bin."""
+    if value_ms < 100:
+        return 1.0
+    if value_ms < 1000:
+        return 10.0
+    return 100.0 if value_ms < 10000 else 1000.0
+
+
+def _is_percentile(column: str) -> bool:
+    return bool(re.match(r"P\d", column))
+
+
 def compare(
     a: list[dict[str, str]], b: list[dict[str, str]], min_noise: float, min_repeats: int = MIN_REPEATS
 ) -> list[dict[str, Any]]:
@@ -172,10 +191,19 @@ def compare(
         delta = sum(deltas) / len(deltas)
         spread = max(deltas) - min(deltas) if len(deltas) > 1 else 0.0
         noise = 0.0 if absolute else max(spread, min_noise)
+        # A percentile is only known to the bin Locust rounded its response times into (1,500 vs 1,400 ms is one bin),
+        # so its floor is at least a bin's width over the value
+        statistical, bin_floor, bin_ms = noise, 0.0, 0.0
+        if _is_percentile(column) and not absolute:
+            mean_a, mean_b = sum(x for x, _ in pairs) / len(pairs), sum(y for _, y in pairs) / len(pairs)
+            bin_ms = max(bin_width_ms(mean_a), bin_width_ms(mean_b))
+            bin_floor = bin_ms / max(min(mean_a, mean_b), 1.0)
+            noise = max(noise, bin_floor)
         if absolute:
             verdict = "different" if delta else "same"
         elif abs(delta) <= noise:
-            verdict = "same" if noise <= 2 * min_noise else "inconclusive (noisy pairs)"
+            # (the bin floor is quantization, not noise: it widens "same" but never makes the pairs "noisy")
+            verdict = "same" if statistical <= 2 * min_noise else "inconclusive (noisy pairs)"
         else:
             verdict = "better" if (delta > 0) == higher_is_better else "worse"
         if len(pairs) < min_repeats:
@@ -190,7 +218,11 @@ def compare(
                 "delta_kind": kind,
                 "pair_deltas": deltas,
                 "noise": noise,
-                "noise_from": "pair spread" if spread > min_noise and not absolute else "--min-noise",
+                "noise_from": (
+                    f"percentile bin {bin_ms:g} ms"
+                    if bin_floor and bin_floor > statistical
+                    else "pair spread" if spread > min_noise and not absolute else "--min-noise"
+                ),
                 "verdict": verdict,
                 "pairs": len(pairs),
             }
@@ -217,12 +249,36 @@ def flagged_runs(side: str, rows: list[dict[str, str]]) -> list[dict[str, Any]]:
     return flagged
 
 
+SAME_ENDPOINT_WARNING = (
+    "same endpoint: B reuses A's cache unless the server was restarted between runs; not a valid A/A"
+)
+
+
+def _host(row: dict[str, str]) -> str:
+    """The run's target host, normalized (scheme and case ignored, no trailing slash); empty when not recorded."""
+    host = row.get("Target Host", "").strip().lower()
+    return re.sub(r"^https?://", "", host).rstrip("/")
+
+
+def warnings_for(a: list[dict[str, str]], b: list[dict[str, str]]) -> list[str]:
+    """Why the comparison may mislead: both sides sent to one host, so B_i's requests (A_i's exact ones, by design)
+    hit the cache A_i filled."""
+    shared = sorted(({_host(r) for r in a} & {_host(r) for r in b}) - {""})
+    return [f"{SAME_ENDPOINT_WARNING} ({', '.join(shared)})"] if shared else []
+
+
 def _flag_lines(flagged: list[dict[str, Any]]) -> list[str]:
     return [f"!!! {f['side']} run {f['run']}: {'; '.join(f['reasons'])} (it is in the figures above)" for f in flagged]
 
 
-def markdown(results: list[dict[str, Any]], a_runs: int, b_runs: int, flagged: Optional[list] = None) -> str:
-    lines = [
+def markdown(
+    results: list[dict[str, Any]],
+    a_runs: int,
+    b_runs: int,
+    flagged: Optional[list] = None,
+    warnings: Optional[list] = None,
+) -> str:
+    lines = [f"!!! WARNING: {w}" for w in warnings or []] + [
         f"A: {a_runs} run(s), B: {b_runs} run(s), paired in order",
         "",
         "| metric | A | B | mean delta | noise floor (from) | pairs | per-pair deltas | verdict |",
@@ -265,6 +321,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         results = compare(a, b, args.min_noise, args.min_repeats)
         flagged = flagged_runs("A", a) + flagged_runs("B", b)
+        warnings = warnings_for(a, b)
+        for warning in warnings:
+            print(f"compare: !!! WARNING: {warning}", file=sys.stderr)
         if args.json:
             with open(args.json, "w") as f:
                 json.dump(
@@ -273,12 +332,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "b_runs": len(b),
                         "metrics": results,
                         "flagged_runs": flagged,
+                        "warnings": warnings,
                         "ignored": ignored,
                     },
                     f,
                     indent=2,
                 )
-        table = markdown(results, len(a), len(b), flagged)
+        table = markdown(results, len(a), len(b), flagged, warnings)
         if args.markdown:
             with open(args.markdown, "w") as f:
                 f.write(table)

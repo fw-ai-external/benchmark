@@ -382,11 +382,26 @@ class PrefixReuseProbe:
     seconds = 0.0
 
 
+def prefix_reuse_probe_flags() -> Optional[str]:
+    """The flags a scored run takes from the probe's measurement, None when it measured no overhang."""
+    w, b = PrefixReuseProbe.overhang, PrefixReuseProbe.boundary
+    if w is None:
+        return None
+    return f"--prefix-reuse-overhang {w}" + (f" --prefix-restore-boundary {b}" if b else "")
+
+
+def print_prefix_reuse_probe_flags() -> None:
+    """The line a person (or a script) takes the probe's flags from; nothing when it measured no overhang."""
+    flags = prefix_reuse_probe_flags()
+    if flags:
+        print(f"Prefix reuse probe: pass these flags to the scored runs: {flags}", flush=True)
+
+
 def prefix_reuse_probe_entries() -> dict:
     if not PrefixReuseProbe.points:
         return {}
     w, b = PrefixReuseProbe.overhang, PrefixReuseProbe.boundary
-    suggested = f"--prefix-reuse-overhang {w}" + (f" --prefix-restore-boundary {b}" if b else "")
+    suggested = prefix_reuse_probe_flags()
     return {
         "prefix_reuse_probe_points": "; ".join(f"{s}shared->{c}cached" for s, c in PrefixReuseProbe.points),
         "prefix_reuse_probe_overhang": "" if w is None else w,
@@ -401,7 +416,7 @@ def prefix_reuse_probe_entries() -> dict:
         "prefix_reuse_probe_first_misses": PrefixReuseProbe.first_misses,
         "prefix_reuse_probe_never_hit": ",".join(map(str, PrefixReuseProbe.misses)),
         "prefix_reuse_probe_failed": PrefixReuseProbe.failed,
-        "prefix_reuse_probe_suggested": "" if w is None else suggested,
+        "prefix_reuse_probe_suggested": suggested or "",
     }
 
 
@@ -5159,6 +5174,87 @@ def validate_shape_mix_options(options: argparse.Namespace) -> None:
     parse_shape_mix(options.shape_mix, chat_overhead_tokens=overhead)
 
 
+def validate_run_options(options: argparse.Namespace, host: Optional[str] = None) -> None:
+    """Every check of the options that needs nothing built: raises ValueError naming the bad combination. Run at init,
+    so a bad command line fails at once, not after minutes of prefix building (users, which used to make most of these
+    checks, only start after the prefix pool is built)."""
+    get = lambda name, default=None: getattr(options, name, default)
+    paced = get("qps") is not None or bool(get("burst")) or get("ramping_time") is not None
+    if get("systemone") and (get("rerank") or get("embeddings")):
+        raise ValueError("--systemone is mutually exclusive with --rerank and --embeddings")
+    if get("replay_schedule") and not get("prefix_fill"):
+        if not get("shape_mix"):
+            raise ValueError("--replay-schedule needs --shape-mix (its classes and prefix pools)")
+        if paced:
+            raise ValueError("--replay-schedule sets the send times; drop --qps, --burst and --ramping-time")
+    elif get("prefix_reuse_probe"):
+        if paced:
+            raise ValueError("--prefix-reuse-probe is a standalone step; drop --qps, --burst and --ramping-time")
+        if get("replay_schedule") or get("prefix_fill"):
+            raise ValueError("--prefix-reuse-probe is a standalone step; drop --replay-schedule and --prefix-fill")
+    elif get("prefix_fill"):
+        if not get("shape_mix"):
+            raise ValueError("--prefix-fill needs --shape-mix")
+        if paced:
+            raise ValueError("--prefix-fill sends at --prefix-fill-concurrency; drop --qps, --burst and --ramping-time")
+        if get("prefix_fill_concurrency", 1) < 1:
+            raise ValueError("--prefix-fill-concurrency must be >= 1")
+        if get("prefix_fill_passes", 1) < 1:
+            raise ValueError("--prefix-fill-passes must be >= 1")
+    elif get("qps") is not None:
+        if get("burst"):
+            raise ValueError("Burst and QPS modes are mutually exclusive")
+        # The pacer checks its own arrival parameters when built: build one now (it is cheap and pure)
+        FixedQPSPacer(
+            options.qps,
+            get("qps_distribution", "constant"),
+            resolve_qps_cv2(options),
+            resolve_request_seed(options),
+            get("qps_modulation_window"),
+            resolve_qps_dispersion(options),
+            rate_block_windows(options),
+        )
+    elif get("ramping_time") is not None:
+        if get("burst"):
+            raise ValueError("Burst and ramping modes are mutually exclusive")
+        if get("num_users") is None:
+            raise ValueError("--ramping-time requires -u/--users to be specified")
+    if get("shape_mix"):
+        if get("systemone") or get("embeddings") or get("rerank"):
+            raise ValueError("--shape-mix only applies to text generation (not --systemone, --embeddings, --rerank)")
+        if get("dataset", "limericks") != "limericks":
+            raise ValueError("--shape-mix builds its own prompts and can't be combined with --dataset")
+        if get("prompt_cache_max_len", 0) > 0:
+            raise ValueError("--shape-mix sets cached tokens per class; drop -pcml/--prompt-cache-max-len")
+        if get("prompt_images_with_resolutions"):
+            raise ValueError("--shape-mix doesn't support --prompt-images-with-resolutions")
+        if get("shape_mix_output_mode") == "max" and get("force_min_tokens"):
+            raise ValueError("--shape-mix-output-mode max lets the model stop early; drop --force-min-tokens")
+        # A warm-up is sent by the setup itself before time 0, which needs the provider to build its requests (a
+        # provider only the /v1/models probe would name comes too late for it)
+        if not get("provider") and not (host and provider_from_host(host, bool(get("systemone")))):
+            warm_rows = False
+            if get("replay_schedule") and not get("prefix_fill") and not get("no_warmup"):
+                names = tuple(c.name for c in parse_shape_mix(options.shape_mix).classes)
+                warm_rows = any(e.warmup for e in replay_entries(options, names))
+            if warmup_plan(options).mode != "none" or warm_rows:
+                raise ValueError(
+                    "a warm-up needs --provider (or a --host that names it): its requests are built before time 0"
+                )
+
+
+@events.init.add_listener
+def _validate_run_options_on_init(environment, **_kwargs):
+    options = getattr(environment, "parsed_options", None)
+    if options is None:
+        return
+    try:
+        validate_run_options(options, getattr(environment, "host", None))
+    except (OSError, ValueError) as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+
 @events.init.add_listener
 def _validate_shape_mix_on_init(environment, **_kwargs):
     options = getattr(environment, "parsed_options", None)
@@ -7111,6 +7207,7 @@ class LLMUser(HttpUser):
                 f"{len(PrefixReuseProbe.misses)}) in {PrefixReuseProbe.seconds:.1f}s{size_note}; use "
                 f"--prefix-reuse-overhang {w}" + (f" --prefix-restore-boundary {b}" if b else "")
             )
+        print_prefix_reuse_probe_flags()
         gevent.spawn(InitTracker._do_quit)
         gevent.sleep(1)
 
@@ -8314,8 +8411,11 @@ def init_parser(parser):
         help="Standalone step (D-111): measure what the server reuses. Sends one prompt, then prompts sharing its "
         "first S tokens with divergent tails (a comma list of S with --prefix-reuse-probe-lengths), reads the "
         "engine's cached tokens, and infers the prefix reuse overhang and restore boundary, printed and in the "
-        "summary (Prefix Reuse Probe ...), with the flags to pass. Run it as a family's first job, before scored "
-        "steps; it quits when done.",
+        "summary (Prefix Reuse Probe ...); it prints the exact flags line to pass ('Prefix reuse probe: pass these "
+        "flags to the scored runs: --prefix-reuse-overhang W [--prefix-restore-boundary B]', also the summary's "
+        "Prefix Reuse Probe Suggested). Run it as a family's first job, before scored steps; it quits when done, "
+        "with exit code 0 when it measured something (it sends no scored requests, which would otherwise read as a "
+        "failed run) and 1 when it measured nothing or failed.",
     )
     parser.add_argument(
         "--prefix-reuse-probe-lengths",
@@ -8960,7 +9060,20 @@ def _(environment, **kw):
     num_requests, num_failures = request_counts(environment.stats)
     fail_ratio = (num_failures / num_requests) if num_requests > 0 else 1.0
     outcomes = request_outcome_entries(environment.stats)
-    if fail_ratio > environment.parsed_options.max_fail_ratio or total_latency is None:
+    probing = getattr(environment.parsed_options, "prefix_reuse_probe", False)
+    # A --prefix-reuse-probe step sends no scored request by design: it succeeded if it measured something
+    run_failed = (
+        (not PrefixReuseProbe.points or bool(PrefixReuseProbe.failed))
+        if probing
+        else (fail_ratio > environment.parsed_options.max_fail_ratio or total_latency is None)
+    )
+    if run_failed and probing:
+        logger.error(
+            f"--prefix-reuse-probe measured nothing usable ({len(PrefixReuseProbe.points)} points, "
+            f"{PrefixReuseProbe.failed} failures); the exit code is 1"
+        )
+        environment.process_exit_code = 1
+    elif run_failed:
         logger.error(
             f"Test failed: {num_failures}/{num_requests} requests failed ({fail_ratio:.2%}); "
             f"load-shed (429/503) {outcomes['requests_load_shed']}, timeouts {outcomes['requests_timeout']}, "
@@ -9037,7 +9150,7 @@ def _(environment, **kw):
     entries["qps"] = total_latency.total_rps if total_latency is not None else 0.0
     # A row from a run that failed its --max-fail-ratio (or sent no scored request) must not read as a data
     # point: mark it (N10-145-1)
-    entries["failed"] = int(fail_ratio > environment.parsed_options.max_fail_ratio or total_latency is None)
+    entries["failed"] = int(run_failed)
     entries["fail_ratio"] = fail_ratio
     percentile_to_report = [50, 90, 95, 99, 99.9]
     for percentile_metric in percentile_metrics:
@@ -9122,6 +9235,8 @@ def _(environment, **kw):
         entries.update(Warmup.summary_entries())
         hit = MeasuredReuse.hit_rate()
         entries["measured_hit_rate"] = "" if hit is None else hit
+        # Where the run was sent (not part of the workload identity: it is what A and B differ by, unless they share it)
+        entries["target_host"] = getattr(environment, "host", "") or ""
         entries["workload_sha256"] = workload_sha256(environment.parsed_options)
         entries["workload_options"] = workload_options(environment.parsed_options)
         entries["workload_options_sha256"] = hashlib.sha256(entries["workload_options"].encode()).hexdigest()
