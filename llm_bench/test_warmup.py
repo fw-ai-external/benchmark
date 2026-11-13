@@ -586,25 +586,42 @@ def test_compare_refuses_when_a_sides_repeats_disagree_or_the_identity_is_missin
 
 def test_compare_reports_deltas_against_the_noise_floor(tmp_path, capsys) -> None:
     a = [
-        _summary(tmp_path / "a1.csv", [{"P50 Time To First Token": "100"}]),
-        _summary(tmp_path / "a2.csv", [{"P50 Time To First Token": "110", "Qps": "39.0"}]),
+        _summary(tmp_path / f"a{i}.csv", [{"P50 Time To First Token": ttft, "Qps": qps, "Measured Hit Rate": "0.6"}])
+        for i, (ttft, qps) in enumerate([("100", "39.0"), ("110", "39.0"), ("105", "39.0")])
     ]
-    b = _summary(
-        tmp_path / "b.csv",
-        [{"P50 Time To First Token": "150", "P99 Total Latency": "890", "Qps": "39.2", "Measured Hit Rate": "0.7"}],
-    )
+    b = [
+        _summary(
+            tmp_path / f"b{i}.csv",
+            [{"P50 Time To First Token": "150", "P99 Total Latency": "890", "Qps": "39.2", "Measured Hit Rate": "0.7"}],
+        )
+        for i in range(3)
+    ]
     out = tmp_path / "out.json"
     md = tmp_path / "out.md"
-    assert compare.main(["--a", *a, "--b", b, "--json", str(out), "--markdown", str(md)]) == 0
+    assert compare.main(["--a", *a, "--b", *b, "--json", str(out), "--markdown", str(md)]) == 0
     by_metric = {m["metric"]: m for m in json.loads(out.read_text())["metrics"]}
     ttft = by_metric["P50 Time To First Token"]
     assert ttft["verdict"] == "worse" and ttft["noise"] == pytest.approx(10 / 105)  # the repeats' spread beats 3%
+    assert ttft["noise_from"] == "repeat spread" and by_metric["Qps"]["noise_from"] == "--min-noise"
     assert by_metric["Qps"]["verdict"] == "same"  # +0.5% against a 3% floor
     assert by_metric["P99 Total Latency"]["verdict"] == "same"  # -1.1%
     assert by_metric["Measured Hit Rate"]["verdict"] == "better" and by_metric["Measured Hit Rate"]["delta"] == (
         pytest.approx(0.1)
     )
-    assert "| P50 Time To First Token |" in md.read_text() and "worse" in capsys.readouterr().out
+    text = md.read_text()
+    assert "| P50 Time To First Token |" in text and "(repeat spread)" in text and "| 3/3 |" in text
+
+
+def test_g3_a_better_or_worse_verdict_needs_three_repeats_per_side(tmp_path) -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    one = lambda v: dict(ident, **{"P90 Time To First Token": v})
+    for repeats in (1, 2):
+        verdicts = compare.compare([one("100")] * repeats, [one("110")] * repeats, 0.03)
+        assert verdicts[0]["verdict"] == "inconclusive (too few repeats)", repeats
+    assert compare.compare([one("100")] * 3, [one("110")] * 3, 0.03)[0]["verdict"] == "worse"
+    assert compare.compare([one("100")] * 3, [one("110")] * 2, 0.03)[0]["verdict"] == "inconclusive (too few repeats)"
+    assert compare.compare([one("100")] * 2, [one("110")] * 2, 0.03, min_repeats=2)[0]["verdict"] == "worse"
+    assert compare.compare([one("100")] * 2, [one("101")] * 2, 0.03)[0]["verdict"] == "same"  # inside the floor
 
 
 def test_the_summary_carries_the_identity_compare_needs(tmp_path) -> None:
@@ -941,3 +958,114 @@ def test_f11_the_last_window_is_over_the_full_window_whenever_it_is_asked() -> N
     assert window.rate(14.0) == pytest.approx(1.0)  # [4, 14]: three responses, all hits
     assert window.rate(11.0) == pytest.approx(2 / 3)  # [1, 11]: asked later, an earlier window is still whole
     assert window.rate(14.0) == pytest.approx(1.0)
+
+
+# --- fix round 2 ---------------------------------------------------------------------------------------------------
+
+
+def test_g1_a_scored_row_continues_from_the_sessions_sent_text_when_that_covers_its_lead_in(tmp_path) -> None:
+    """The class pool prefix (sized to the longest recorded shared length) is longer than the session's text, and
+    used to win: the first scored row after a full warm-up reused none of the warm-up. The bar a lead-in is covered by
+    (its content against the session's last prompt plus reply) is the bar the scored row now continues by."""
+    mix = {
+        "seed": 5,
+        "classes": [
+            {
+                "name": "chat",
+                "weight": 1.0,
+                "prompt_tokens": 1500,
+                "cached_prompt_tokens": 800,
+                "generated_tokens": 4,
+                "prefix_pool_size": 1,
+            }
+        ],
+    }
+    # 30 template tokens and a 10-token head: the lead-in's content (720 - 30) is held by the warm-up row (670 content
+    # tokens + a 20-token reply), but the scored row wants 720 - 10 shared, which that text is just short of
+    rows = [
+        _row(-0.5, "s1", 700, 0, warmup=True, output_length=20),
+        _row(-0.1, "s1", 720, 0, lead_in=True),
+        _row(0.0, "s1", 1200, 720),
+    ]
+    path = tmp_path / "s.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    tokenizer = WordTokenizer()
+    ds = _dataset(mix, tokenizer=tokenizer, split_restore_classes=False, chat_overhead_tokens=30, chat_head_tokens=10)
+    ds.build_prefixes()
+    entries = load_replay_schedule(str(path), ("chat",))
+    ds.prepare_replay(entries, message_overhead=lambda n: 30, incremental=True)
+    assert ds.lay_out_replay_row(entries[0]) and not ds.lay_out_replay_row(entries[1])  # the lead-in is covered
+    assert ds.lay_out_replay_row(entries[2])
+    warm, scored = ds.replay_request(entries[0]), ds.replay_request(entries[2])
+    shared = _common_prefix(tokenizer.encode(warm.prompt), tokenizer.encode(scored.prompt))
+    assert shared >= 650 and scored.reusable_tokens >= 650  # the warm-up's text, not the pool prefix and a fresh tail
+
+
+def _clock(monkeypatch, jump: float) -> None:
+    """The wall clock `jump` seconds ahead of where the monotonic clock says it is (a host that slept)."""
+    real = time.time
+    monkeypatch.setattr(load_test.time, "time", lambda: real() + jump)
+
+
+def test_g2_a_stall_that_stopped_the_monotonic_clock_fails_the_delivery_check(monkeypatch) -> None:
+    options = _run_options(MIX, qps=2.0, qps_max_lateness=0.5, qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    on_time = [i / 2 for i in range(40)]
+    _timeline(on_time, on_time)  # every send went out exactly on its intended time on the monotonic clock
+    SendTimeline.spawned()
+    assert delivery_entries(options, None, 0.0)[1] == []  # a healthy run
+    _clock(monkeypatch, 944.0)  # ... but 944 s passed on the wall clock: the laptop slept
+    entries, failures = delivery_entries(options, None, 0.0)
+    assert entries["delivery_check"] == "fail" and entries["clock_stall_s"] == pytest.approx(944, abs=1)
+    assert any("clock stopped for 944 s" in f for f in failures)
+
+
+def test_g2_a_replay_that_sent_a_fraction_of_the_rows_due_by_the_wall_clock_fails(monkeypatch) -> None:
+    entries = tuple(load_test.ScheduleEntry(offset=i * 3.5, class_index=0, index=i) for i in range(280))
+    pacer = ReplayPacer(entries, "s.jsonl")
+    pacer.sent_rows = 81  # the schedule paused when the host slept: 81 of 280 rows went out
+    options = _run_options(MIX, qps=None, replay_schedule="s.jsonl", qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    sent = [e.offset for e in entries[:81]]
+    _timeline(sent, sent)
+    SendTimeline.spawned()
+    _clock(monkeypatch, 944.0)
+    summary, failures = delivery_entries(options, pacer, 0.0)
+    assert summary["delivery_check"] == "fail"
+    assert any(
+        "only 81 of 269 rows due by the wall clock were sent" in f for f in failures
+    )  # 3.5 s apart, to 944 s less the slack
+
+
+def test_g2_a_burst_after_a_stall_is_not_delivery() -> None:
+    options = _run_options(MIX, qps=2.0, qps_max_lateness=0.5, qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    intended = [i / 2 for i in range(21)]  # 10 s of schedule
+    _timeline(intended, [10.0 + i / 5 for i in range(21)])  # sent in 4 s: a backlog released at once
+    entries, failures = delivery_entries(options, None, 0.0)
+    assert entries["delivered_over_intended"] == pytest.approx(2.5)
+    assert any("faster than intended" in f for f in failures) and entries["delivery_check"] == "fail"
+
+
+def test_g4_the_lead_ins_after_a_cut_go_out_in_schedule_order_one_after_another(monkeypatch, tmp_path) -> None:
+    spans = []
+
+    def slow(self, request, one_token=False):
+        start = time.monotonic()
+        time.sleep(0.15)
+        spans.append((request.schedule_row, start, time.monotonic()))
+        return (request.prompt_tokens, 0)
+
+    monkeypatch.setattr(UnscoredSender, "post", slow)
+    rows = [
+        _row(-0.3, "s1", 700, 400, warmup=True),
+        _row(-0.2, "s2", 700, 400, warmup=True),
+        _row(-0.1, "s3", 800, 0, lead_in=True),  # three scored sessions' lead-ins, none ahead of a dropped row
+        _row(-0.1, "s4", 800, 0, lead_in=True),
+        _row(-0.1, "s5", 800, 0, lead_in=True),
+        _row(0.0, "s3", 1000, 800),
+    ]
+    _replay_run(tmp_path, "http://127.0.0.1:9", WarmupPlan("requests", requests=0, window_s=0.3), rows=rows)
+    ahead = sorted(s for s in spans if s[0] in (2, 3, 4))
+    assert [row for row, *_ in ahead] == [2, 3, 4]  # schedule order
+    assert ahead[1][1] >= ahead[0][2] - 0.01 and ahead[2][1] >= ahead[1][2] - 0.01  # each after the one before

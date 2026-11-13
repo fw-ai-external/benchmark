@@ -9,7 +9,9 @@ tokenizer, output mode, chat mode ...), the request seed, the number of warm-up 
 llm_bench version must match (across the repeats of a side too); otherwise this refuses (exit 2) and says which
 differ. Rows that are not measured runs (a --prefix-fill step) are ignored, and said so. Else it reports per-metric
 deltas against a noise floor, max(the spread of the repeats on either side, --min-noise): a delta inside it reads
-"same", unless the floor is over twice --min-noise, when the repeats are too noisy to say ("inconclusive"). A metric
+"same", unless the floor is over twice --min-noise, when the repeats are too noisy to say ("inconclusive"). A better
+or worse verdict needs --min-repeats (3) repeats on each side, else it reads "inconclusive (too few repeats)". Each
+metric's noise floor, and where it came from (the repeats' spread or --min-noise), is reported. A metric
 that is 0 on A and not on B reads "different". A run that failed its delivery check or its --max-fail-ratio is
 flagged in the output (it is still in the averages). Exit 0 compared, 2 refused, 1 error.
 
@@ -137,14 +139,20 @@ def _spread(values: list[float], kind: str) -> float:
     return width if kind == "abs" else (width / abs(mean) if mean else 0.0)
 
 
-def compare(a: list[dict[str, str]], b: list[dict[str, str]], min_noise: float) -> list[dict[str, Any]]:
+MIN_REPEATS = 3  # a better / worse verdict needs this many repeats on each side
+
+
+def compare(
+    a: list[dict[str, str]], b: list[dict[str, str]], min_noise: float, min_repeats: int = MIN_REPEATS
+) -> list[dict[str, Any]]:
     results = []
     for column, higher_is_better, kind in METRICS:
         va, vb = _numbers(a, column), _numbers(b, column)
         if not va or not vb:
             continue
         mean_a, mean_b = sum(va) / len(va), sum(vb) / len(vb)
-        noise = max(_spread(va, kind), _spread(vb, kind), min_noise)
+        spread = max(_spread(va, kind), _spread(vb, kind))
+        noise = max(spread, min_noise)
         if kind == "abs":
             delta = mean_b - mean_a
         elif mean_a:
@@ -157,6 +165,8 @@ def compare(a: list[dict[str, str]], b: list[dict[str, str]], min_noise: float) 
             verdict = "different"
         elif abs(delta) <= noise:
             verdict = "same" if noise <= 2 * min_noise else "inconclusive (noisy repeats)"
+        elif min(len(va), len(vb)) < min_repeats:
+            verdict = "inconclusive (too few repeats)"  # two runs per side can't tell a change from run-to-run noise
         else:
             verdict = "better" if (delta > 0) == higher_is_better else "worse"
         results.append(
@@ -167,6 +177,7 @@ def compare(a: list[dict[str, str]], b: list[dict[str, str]], min_noise: float) 
                 "delta": delta,
                 "delta_kind": kind,
                 "noise": noise,
+                "noise_from": "repeat spread" if spread > min_noise else "--min-noise",
                 "verdict": verdict,
                 "repeats_a": len(va),
                 "repeats_b": len(vb),
@@ -203,12 +214,15 @@ def markdown(results: list[dict[str, Any]], a_runs: int, b_runs: int, flagged: O
     lines = [
         f"A: {a_runs} run(s), B: {b_runs} run(s)",
         "",
-        "| metric | A | B | delta | noise | verdict |",
-        "|---|---|---|---|---|---|",
+        "| metric | A | B | delta | noise floor (from) | repeats A/B | verdict |",
+        "|---|---|---|---|---|---|---|",
     ]
     for r in results:
         noise = f"{r['noise']:.4f}" if r["delta_kind"] == "abs" else f"{100 * r['noise']:.1f}%"
-        lines.append(f"| {r['metric']} | {r['a']:.4g} | {r['b']:.4g} | {_format_delta(r)} | {noise} | {r['verdict']} |")
+        lines.append(
+            f"| {r['metric']} | {r['a']:.4g} | {r['b']:.4g} | {_format_delta(r)} | {noise} ({r['noise_from']}) "
+            f"| {r['repeats_a']}/{r['repeats_b']} | {r['verdict']} |"
+        )
     return "\n".join(lines + [""] + _flag_lines(flagged or [])) + "\n"
 
 
@@ -217,6 +231,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--a", nargs="+", required=True, metavar="SUMMARY", help="A's summary CSV(s).")
     parser.add_argument("--b", nargs="+", required=True, metavar="SUMMARY", help="B's summary CSV(s).")
     parser.add_argument("--min-noise", type=float, default=0.03, help="Least noise floor (default 0.03).")
+    parser.add_argument(
+        "--min-repeats",
+        type=int,
+        default=MIN_REPEATS,
+        help=f"Repeats each side needs for a better / worse verdict (default {MIN_REPEATS}); fewer reads inconclusive.",
+    )
     parser.add_argument("--json", default=None, help="Write the comparison here as JSON.")
     parser.add_argument("--markdown", default=None, help="Write the comparison here as a markdown table.")
     args = parser.parse_args(argv)
@@ -231,7 +251,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             for problem in problems:
                 print(f"  - {problem}", file=sys.stderr)
             return 2
-        results = compare(a, b, args.min_noise)
+        results = compare(a, b, args.min_noise, args.min_repeats)
         flagged = flagged_runs("A", a) + flagged_runs("B", b)
         if args.json:
             with open(args.json, "w") as f:

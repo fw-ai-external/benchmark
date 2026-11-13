@@ -2396,7 +2396,17 @@ class ShapeMixDataset:
                 RESTORE_BOUNDARY_MARGIN_TOKENS if self.restore_boundary else 0
             )
             need = max(0, need)
-        source = self._replay_source(need, prompts, previous, pool, pool_tokens)
+        # With warm-up rows, a row whose session's sent text holds its recorded cached length (the bar a lead-in is
+        # covered by, see _lead_in_covered) continues from that text: the class pool prefix, sized to the longest
+        # recorded shared length, is longer than the session's text and would win, and the row would reuse none of it
+        prefer_previous = bool(
+            self._warm_schedule
+            and previous
+            and not entry.lead_in
+            and entry.cached_length is not None
+            and sum(self._segment_tokens(seg) for seg in previous) >= entry.cached_length - self._replay_template
+        )
+        source = self._replay_source(need, prompts, previous, pool, pool_tokens, prefer_previous)
         if want is None:
             want = sum(self._segment_tokens(seg) for seg in source)
         output = entry.output_length or cls.generated_tokens
@@ -2549,10 +2559,18 @@ class ShapeMixDataset:
             self._build_replay_windows(missing)
 
     def _replay_source(
-        self, want: Optional[int], prompts: Optional[list], previous: Optional[list], pool: list, pool_tokens: int
+        self,
+        want: Optional[int],
+        prompts: Optional[list],
+        previous: Optional[list],
+        pool: list,
+        pool_tokens: int,
+        prefer_previous: bool = False,
     ) -> list:
         """What a row reuses from: the session's most recent earlier prompt covering `want`, else the previous
-        prompt plus its synthetic reply, else the class pool prefix, else the longest of those."""
+        prompt plus its synthetic reply, else the class pool prefix, else the longest of those. With
+        `prefer_previous` (the session's sent text covers the row's recorded cached length, as a lead-in's coverage is
+        judged) the previous prompt plus reply is used over the pool, however long the pool prefix is."""
         if not prompts:
             return pool
         if want is None:
@@ -2561,7 +2579,7 @@ class ShapeMixDataset:
             if tokens >= want:
                 return segments
         previous_tokens = sum(self._segment_tokens(seg) for seg in previous)
-        if previous_tokens >= want or previous_tokens >= pool_tokens:
+        if previous_tokens >= want or previous_tokens >= pool_tokens or prefer_previous:
             return previous
         return pool
 
@@ -4388,6 +4406,7 @@ class SendTimeline:
     # The first send after "All users spawned" (D-154): setup and the first preparation can push it past the
     # window's start, which is the run's start-up shift - separate from the in-load schedule shift (resyncs)
     spawned_monotonic = None
+    spawned_wall = None  # the same moment on the wall clock: the monotonic clock stops while the host sleeps
     first_send_offset = None
 
     @classmethod
@@ -4401,6 +4420,15 @@ class SendTimeline:
     def spawned(cls, at: Optional[float] = None) -> None:
         """Stamp the window's start: now, or `at` (a monotonic time) when the window is set up ahead of it."""
         cls.spawned_monotonic = time.monotonic() if at is None else at
+        cls.spawned_wall = time.time() + (cls.spawned_monotonic - time.monotonic())
+
+    @classmethod
+    def clock_stall_s(cls) -> Optional[float]:
+        """Seconds the wall clock moved beyond the monotonic clock since the window started: a host that slept (the
+        monotonic clock stops during sleep, so a schedule driven by it simply pauses). None before the window."""
+        if cls.spawned_monotonic is None or cls.spawned_wall is None:
+            return None
+        return (time.time() - cls.spawned_wall) - (time.monotonic() - cls.spawned_monotonic)
 
     @classmethod
     def reset(cls) -> None:
@@ -4408,7 +4436,7 @@ class SendTimeline:
         cls.actual = array("d")
         cls.planned = array("d")
         cls.skipped = 0
-        cls.spawned_monotonic = None
+        cls.spawned_monotonic = cls.spawned_wall = None
         cls.first_send_offset = None
 
 
@@ -4524,6 +4552,10 @@ def idle_rule_gap_cv2(times) -> Optional[float]:
     return max(0.0, squared / gaps - mean * mean) / (mean * mean)
 
 
+# A window's wall-clock time may exceed its monotonic time by this many seconds before the host is judged to have slept
+CLOCK_STALL_SLACK_S = 5.0
+
+
 def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> tuple[dict[str, Any], list[str]]:
     """The measured phase's delivery figures and what fails --fail-on-delivery.
 
@@ -4542,12 +4574,17 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
     intended_qps = (sent - 1) / intended_span if intended_span > 0 else None
     went_out = sent / (sent + skipped) if sent else None
     ratio = (intended_span / span) * went_out if span > 0 and intended_span > 0 else None
+    stall = SendTimeline.clock_stall_s()
     if replaying:
         offsets = [e.offset for e in pacer.entries] if pacer is not None else []
         target_span = offsets[-1] - offsets[0] if len(offsets) > 1 else 0.0
         target = (len(offsets) - 1) / target_span if target_span > 0 else None
         due = (pacer.sent_rows + pacer.skipped_rows) if pacer is not None else 0
         late_share = pacer.late_rows / due if due else 0.0
+        # Rows that were due by the wall clock (with a few seconds of slack for the end of the run): a schedule paused
+        # by a host's sleep has sent far fewer than that
+        elapsed = time.time() - SendTimeline.spawned_wall if SendTimeline.spawned_wall is not None else 0.0
+        due_by_wall = sum(1 for o in offsets if o <= elapsed - CLOCK_STALL_SLACK_S)
     else:
         target = getattr(options, "qps", None)
         max_late = getattr(options, "qps_max_lateness", DEFAULT_MAX_LATENESS_SECONDS)
@@ -4555,6 +4592,16 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
         late_share = (late + skipped) / (sent + skipped) if sent + skipped else 0.0
     failures = []
     minimum = getattr(options, "qps_min_delivered", 0.95)
+    elapsed_mono = time.monotonic() - SendTimeline.spawned_monotonic if SendTimeline.spawned_monotonic else 0.0
+    if stall is not None and stall > max(CLOCK_STALL_SLACK_S, 0.01 * elapsed_mono):
+        failures.append(
+            f"the clock stopped for {stall:.0f} s during the window (the host slept?): the schedule paused, and "
+            f"the rows due and the lateness were counted on a clock that did not run"
+        )
+    if replaying and due_by_wall and (sent + skipped) < minimum * due_by_wall:
+        failures.append(f"only {sent + skipped} of {due_by_wall} rows due by the wall clock were sent")
+    if ratio is not None and ratio > 1 / minimum:
+        failures.append(f"delivered {ratio:.2f}x faster than intended (a burst after a stall is not delivery)")
     if ratio is not None and ratio < minimum:
         failures.append(
             f"delivered {delivered:.3f} QPS against {intended_qps:.3f} intended by its schedule "
@@ -4572,6 +4619,7 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
         "intended_qps": "" if intended_qps is None else intended_qps,
         "target_qps": "" if not target else target,
         "delivered_over_intended": "" if ratio is None else ratio,
+        "clock_stall_s": "" if stall is None else stall,
         "late_send_share": late_share,
         "delivery_check": ("fail" if failures else "pass") if enabled else "off",
         "delivery_failures": "; ".join(failures),
@@ -5765,16 +5813,13 @@ def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDat
                 LeadIns.dropped += 1
             else:
                 ahead.append(entry)
-        groups: dict = {}
-        for entry in ds.lay_out_replay_rows(ahead):
-            groups.setdefault(entry.session if entry.session is not None else f"#row{entry.index}", []).append(entry)
-        lead_started = time.monotonic()
-        pool = gevent.pool.Pool(max(1, options.prefix_fill_concurrency))
-        for rows in groups.values():
-            prior = lead_chain.get(rows[0].session)
-            pool.spawn(lambda rows=rows, prior=prior: [after(prior, lead_send, ds.replay_request(e)) for e in rows])
-        pool.join()
+        # In schedule order, each after the one before completes (and after the warm-up requests still in flight):
+        # they share pool prefixes, so concurrent sends would make their own cached counts depend on arrival order,
+        # and A and B would differ
         group.join()
+        lead_started = time.monotonic()
+        for entry in ds.lay_out_replay_rows(ahead):
+            lead_send(ds.replay_request(entry))
         LeadIns.seconds = time.monotonic() - lead_started
     LeadIns.skipped = ds.lead_in_skipped
     _finish_warmup(plan, reason, sent, started, window, sender)
