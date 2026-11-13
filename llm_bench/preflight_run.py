@@ -468,7 +468,13 @@ def main(argv=None) -> int:
     server_log = os.path.join(args.out, "mock_server.log")
     request_log = os.path.join(args.out, "mock.requests")
     with open(server_log, "w") as f:
-        server = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+        server = subprocess.Popen(
+            [sys.executable, os.path.join(HERE, "mock_server.py"), "--port", str(port), "--window", str(window)]
+            + ["--boundary", str(boundary), "--tokenizer", tokenizer, "--log", request_log]
+            + ["--chat-head", str(args.mock_chat_head)],
+            stdout=f,
+            stderr=subprocess.STDOUT,
+        )
     try:
         for _ in range(120):
             try:

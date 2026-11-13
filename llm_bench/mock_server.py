@@ -261,8 +261,7 @@ def main(argv=None):
     log = open(args.log, "a") if args.log else None
     ThreadingHTTPServer.daemon_threads = True
     server = ThreadingHTTPServer(
-        (args.host, args.port),
-        make_handler(engine, args.ttft, args.tpot, log, args.slow_fraction, args.slow_ttft),
+        (args.host, args.port), make_handler(engine, args.ttft, args.tpot, log, args.slow_fraction, args.slow_ttft)
     )
     print(
         f"mock_server: http://{args.host}:{args.port}  window {args.window}  boundary {args.boundary}  "
