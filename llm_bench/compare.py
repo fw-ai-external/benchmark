@@ -10,7 +10,8 @@ llm_bench version must match (across the repeats of a side too); otherwise this 
 differ. Rows that are not measured runs (a --prefix-fill step) are ignored, and said so. Else it reports per-metric
 deltas against a noise floor, max(the spread of the repeats on either side, --min-noise): a delta inside it reads
 "same", unless the floor is over twice --min-noise, when the repeats are too noisy to say ("inconclusive"). A better
-or worse verdict needs --min-repeats (3) repeats on each side, else it reads "inconclusive (too few repeats)". Each
+or worse verdict needs --min-repeats (3) repeats on each side; with fewer on a side every verdict reads "inconclusive
+(too few repeats)", the deltas still reported. Each
 metric's noise floor, and where it came from (the repeats' spread or --min-noise), is reported. A metric
 that is 0 on A and not on B reads "different". A run that failed its delivery check or its --max-fail-ratio is
 flagged in the output (it is still in the averages). Exit 0 compared, 2 refused, 1 error.
@@ -165,10 +166,11 @@ def compare(
             verdict = "different"
         elif abs(delta) <= noise:
             verdict = "same" if noise <= 2 * min_noise else "inconclusive (noisy repeats)"
-        elif min(len(va), len(vb)) < min_repeats:
-            verdict = "inconclusive (too few repeats)"  # two runs per side can't tell a change from run-to-run noise
         else:
             verdict = "better" if (delta > 0) == higher_is_better else "worse"
+        if min(len(va), len(vb)) < min_repeats:
+            # Two runs per side can't tell a change from run-to-run noise, and "same" and "different" are claims too
+            verdict = "inconclusive (too few repeats)"
         results.append(
             {
                 "metric": column,

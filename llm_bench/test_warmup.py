@@ -621,7 +621,12 @@ def test_g3_a_better_or_worse_verdict_needs_three_repeats_per_side(tmp_path) -> 
     assert compare.compare([one("100")] * 3, [one("110")] * 3, 0.03)[0]["verdict"] == "worse"
     assert compare.compare([one("100")] * 3, [one("110")] * 2, 0.03)[0]["verdict"] == "inconclusive (too few repeats)"
     assert compare.compare([one("100")] * 2, [one("110")] * 2, 0.03, min_repeats=2)[0]["verdict"] == "worse"
-    assert compare.compare([one("100")] * 2, [one("101")] * 2, 0.03)[0]["verdict"] == "same"  # inside the floor
+    assert compare.compare([one("100")] * 3, [one("101")] * 3, 0.03)[0]["verdict"] == "same"  # inside the floor
+    # with too few repeats "same" and "different" are claims too: every verdict reads inconclusive, the delta stays
+    few = compare.compare([one("100")] * 2, [one("101")] * 2, 0.03)[0]
+    assert few["verdict"] == "inconclusive (too few repeats)" and few["delta"] == pytest.approx(0.01)
+    zero = lambda v: dict(ident, **{"Requests Failed": v})
+    assert compare.compare([zero("0")], [zero("9")], 0.03)[0]["verdict"] == "inconclusive (too few repeats)"
 
 
 def test_the_summary_carries_the_identity_compare_needs(tmp_path) -> None:
@@ -901,14 +906,16 @@ def test_f9_compare_verdicts(tmp_path, capsys) -> None:
     ident = {c: "1" for c, _ in compare.IDENTITY}
     zero_a = [dict(ident, **{"Requests Failed": "0", "Fail Ratio": "0", "P50 Total Latency": "100"})]
     zero_b = [dict(ident, **{"Requests Failed": "250", "Fail Ratio": "0.025", "P50 Total Latency": "100"})]
-    by = {r["metric"]: r for r in compare.compare(zero_a, zero_b, 0.03)}
+    by = {r["metric"]: r for r in compare.compare(zero_a, zero_b, 0.03, min_repeats=1)}
     assert by["Requests Failed"]["verdict"] == "different" and by["Requests Failed"]["delta"] == 250
     assert by["Requests Failed"]["delta_kind"] == "abs"  # the difference, not a relative change from 0
     assert by["P50 Total Latency"]["verdict"] == "same"
     # a noisy side swallows the delta: not "same"
     noisy = [dict(ident, **{"P50 Total Latency": v}) for v in ("100", "160")]
     steady = [dict(ident, **{"P50 Total Latency": v}) for v in ("131", "132")]
-    verdict = {r["metric"]: r for r in compare.compare(noisy, steady, 0.03)}["P50 Total Latency"]["verdict"]
+    verdict = {r["metric"]: r for r in compare.compare(noisy, steady, 0.03, min_repeats=2)}["P50 Total Latency"][
+        "verdict"
+    ]
     assert verdict == "inconclusive (noisy repeats)"
     # runs that failed delivery or the failure ratio are flagged in the output
     a = _summary(tmp_path / "a.csv", [{}])
@@ -1069,3 +1076,38 @@ def test_g4_the_lead_ins_after_a_cut_go_out_in_schedule_order_one_after_another(
     ahead = sorted(s for s in spans if s[0] in (2, 3, 4))
     assert [row for row, *_ in ahead] == [2, 3, 4]  # schedule order
     assert ahead[1][1] >= ahead[0][2] - 0.01 and ahead[2][1] >= ahead[1][2] - 0.01  # each after the one before
+
+
+# --- fix round 3 ---------------------------------------------------------------------------------------------------
+
+
+def test_g5_a_client_stall_that_shifted_the_schedule_fails_the_delivery_check() -> None:
+    """A stalled client shifts the rest of the schedule later and its intended times move with it, so the rate against
+    them still reads 1: the total shift is the stall, and fails the check above max(5 s, 1% of the window)."""
+    options = _run_options(MIX, qps=3.0, qps_max_lateness=0.5, qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    pacer = load_test.FixedQPSPacer(3.0, "constant")
+    pacer.start = time.monotonic()
+    on_time = [i / 3 for i in range(60)]
+    _timeline(on_time, on_time)
+    assert delivery_entries(options, pacer, 0.0)[1] == []
+    assert pacer.resync(0, 1.0)  # a 1 s hiccup: under the bar
+    assert delivery_entries(options, pacer, 0.0)[1] == []
+    assert pacer.resync(1, 20.0)  # the 20 s SIGSTOP of the joint check: the pacer's own shift path
+    entries, failures = delivery_entries(options, pacer, 0.0)
+    assert pacer.shifted_seconds == pytest.approx(21.0)
+    assert entries["delivered_over_intended"] == pytest.approx(1.0) and entries["late_send_share"] == 0.0
+    assert entries["delivery_check"] == "fail" and any("schedule moved 21.0 s later" in f for f in failures)
+
+
+def test_g5_a_replays_shifted_schedule_fails_too() -> None:
+    entries = tuple(load_test.ScheduleEntry(offset=i * 0.5, class_index=0, index=i) for i in range(100))
+    pacer = ReplayPacer(entries, "s.jsonl")
+    pacer.start = time.monotonic()
+    pacer.sent_rows = 100
+    options = _run_options(MIX, qps=None, replay_schedule="s.jsonl", qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    sent = [e.offset for e in entries]
+    _timeline(sent, sent)
+    assert pacer.resync(0, 30.0)
+    assert any("schedule moved 30.0 s later" in f for f in delivery_entries(options, pacer, 0.0)[1])

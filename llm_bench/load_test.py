@@ -4593,6 +4593,14 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
     failures = []
     minimum = getattr(options, "qps_min_delivered", 0.95)
     elapsed_mono = time.monotonic() - SendTimeline.spawned_monotonic if SendTimeline.spawned_monotonic else 0.0
+    # The schedule moves later when the client stalls (a send more than --qps-max-lateness late shifts the rest), and
+    # the intended times then move with it: the rate against them still reads 1. The shift is the stall, in seconds
+    shifted = getattr(pacer, "shifted_seconds", 0.0) or 0.0
+    if shifted > max(CLOCK_STALL_SLACK_S, 0.01 * elapsed_mono):
+        failures.append(
+            f"the schedule moved {shifted:.1f} s later over the window after the client stalled (more than "
+            f"{max(CLOCK_STALL_SLACK_S, 0.01 * elapsed_mono):.1f} s): it did not deliver the schedule it was given"
+        )
     if stall is not None and stall > max(CLOCK_STALL_SLACK_S, 0.01 * elapsed_mono):
         failures.append(
             f"the clock stopped for {stall:.0f} s during the window (the host slept?): the schedule paused, and "
