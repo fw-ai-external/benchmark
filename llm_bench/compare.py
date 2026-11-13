@@ -1,26 +1,27 @@
 """Compare two sets of llm_bench summaries (A = without a change, B = with it) from their --summary-file CSVs.
 
     python -m llm_bench.compare --a A1.csv [A2.csv ...] --b B1.csv [B2.csv ...] [--min-noise 0.03] \\
-        [--json out.json] [--markdown out.md]
+        [--min-repeats 3] [--json out.json] [--markdown out.md]
 
-Every row of a side's files is one repeat. The two sides are only comparable if they saw the same workload: the
-workload files' sha256, the options that change the traffic (replayed pod, retiming, arrival process, -t, corpus,
-tokenizer, output mode, chat mode ...), the request seed, the number of warm-up requests, the target rate and the
-llm_bench version must match (across the repeats of a side too); otherwise this refuses (exit 2) and says which
-differ. Rows that are not measured runs (a --prefix-fill step) are ignored, and said so. Else it reports per-metric
-deltas against a noise floor, max(the spread of the repeats on either side, --min-noise): a delta inside it reads
-"same", unless the floor is over twice --min-noise, when the repeats are too noisy to say ("inconclusive"). A better
-or worse verdict needs --min-repeats (3) repeats on each side; with fewer on a side every verdict reads "inconclusive
-(too few repeats)", the deltas still reported. Each
-metric's noise floor, and where it came from (the repeats' spread or --min-noise), is reported. A metric
-that is 0 on A and not on B reads "different". A run that failed its delivery check or its --max-fail-ratio is
-flagged in the output (it is still in the averages). Exit 0 compared, 2 refused, 1 error.
+The runs are paired: run i uses its own request seed s_i on both sides, A_i warms up to the hit-rate target (and prints
+its N_i), B_i is given --request-seed s_i --warmup-requests N_i, and the runs go A1, B1, A2, B2 ... A repeat with
+the same seed would resend the first run's exact prompts into the cache the first run left and read as a better hit
+rate and TTFT. The rows of --a and of --b (every row is a run, files read in order) are paired in order. Within a pair
+the request seed and the warm-up requests must match; across all the runs the workload files' sha256, the options
+that change the traffic (replayed pod, retiming, arrival process, -t, corpus, tokenizer, output mode, chat mode ...),
+the target rate and the llm_bench version must match; and the seeds must differ from pair to pair. Otherwise this
+refuses (exit 2) and says which differ. Rows that are not measured runs (a --prefix-fill step) are ignored, and said so.
 
-For a trustworthy comparison, run at least 3 repeats per side, alternate A and B (don't run all of one side first),
-and don't run them alongside other load; P99 is the noisiest figure.
+Else each metric's verdict comes from the paired relative deltas (A_i vs B_i): their mean against a noise floor of
+max(--min-noise, the spread (max - min) of the per-pair deltas). Inside the floor it reads "same", unless the floor is
+over twice --min-noise, when the pairs are too noisy to say ("inconclusive (noisy pairs)"). --min-repeats (3) counts
+pairs; with fewer every verdict reads "inconclusive (too few repeats)", the deltas still reported. A metric that is 0
+on A and not on B reads "different". Each metric's floor and where it came from, and every pair's delta, are reported.
+A run that failed its delivery check or its --max-fail-ratio is flagged in the output (it is still in the figures).
+Exit 0 compared, 2 refused, 1 error.
 
-Run B with --warmup-requests N, N being the "Warmup Requests" A reported, so both get the same warm-up and the same
-measured requests.
+For a trustworthy comparison run at least 3 pairs, alternating A and B, not alongside other load; P99 is the noisiest
+figure.
 """
 
 import argparse
@@ -89,109 +90,117 @@ def _same(a: str, b: str) -> bool:
         return a == b
 
 
-def _option_differences(a: dict[str, str], b: dict[str, str]) -> str:
+def _option_differences(a: dict[str, str], b: dict[str, str], ignore: tuple = ()) -> str:
     """Which workload options differ, from the summaries' Workload Options JSON (empty when it isn't there)."""
     try:
         va, vb = json.loads(a.get("Workload Options", "")), json.loads(b.get("Workload Options", ""))
     except ValueError:
         return ""
     return ", ".join(
-        f"{k}: A {va.get(k)!r} vs B {vb.get(k)!r}" for k in sorted(set(va) | set(vb)) if va.get(k) != vb.get(k)
+        f"{k}: A {va.get(k)!r} vs B {vb.get(k)!r}"
+        for k in sorted(set(va) | set(vb))
+        if va.get(k) != vb.get(k) and k not in ignore
     )
 
 
+# Identity that must match across every run of both sides, and the columns that must match within a pair
+SHARED_IDENTITY = [i for i in IDENTITY if i[0] not in ("Request Seed", "Warmup Requests")]
+PAIR_IDENTITY = [i for i in IDENTITY if i[0] in ("Request Seed", "Warmup Requests")]
+
+
 def identity_differences(a: list[dict[str, str]], b: list[dict[str, str]]) -> list[str]:
-    """Why the two sides' workloads differ (and a side's repeats too), empty when they are the same."""
+    """Why the runs can't be compared, empty when they can: unequal counts (they are paired in order), a pair whose
+    seed or warm-up requests differ, a seed repeated across pairs, or a workload identity that differs anywhere."""
+    if len(a) != len(b):
+        return [f"A has {len(a)} run(s) and B {len(b)}: runs are paired in order (A_i with B_i)"]
     problems = []
-    for column, label in IDENTITY:
-        values = {side: [r.get(column, "") for r in rows] for side, rows in (("A", a), ("B", b))}
-        for side, found in values.items():
-            if not all(_same(found[0], v) for v in found):
-                problems.append(f"{label} differs between the {side} repeats: {sorted(set(found))}")
-        if not _same(values["A"][0], values["B"][0]):
-            detail = _option_differences(a[0], b[0]) if column == "Workload Options Sha256" else ""
-            problems.append(
-                f"{label}: A {values['A'][0] or '(none)'} vs B {values['B'][0] or '(none)'}"
-                + (f" ({detail})" if detail else "")
-            )
-        elif not values["A"][0] and column in ("Workload Sha256", "Workload Options Sha256", "Llm Bench Version"):
+    for column, label in PAIR_IDENTITY:
+        for i, (ra, rb) in enumerate(zip(a, b), 1):
+            if not _same(ra.get(column, ""), rb.get(column, "")):
+                problems.append(
+                    f"pair {i}: {label}: A {ra.get(column) or '(none)'} vs B {rb.get(column) or '(none)'}"
+                    + (" (give B_i the --warmup-requests N_i that A_i printed)" if column == "Warmup Requests" else "")
+                )
+    seeds = [r.get("Request Seed", "") for r in a]
+    for seed in sorted({s for s in seeds if seeds.count(s) > 1}):
+        runs = ", ".join(str(i) for i, s in enumerate(seeds, 1) if s == seed)
+        problems.append(
+            f"request seed {seed or '(none)'} is the same in pairs {runs}: a repeat with the same seed resends the "
+            f"first run's prompts into the cache it left; give each pair its own --request-seed"
+        )
+    runs = a + b
+    for column, label in SHARED_IDENTITY:
+        found = [r.get(column, "") for r in runs]
+        if not all(_same(found[0], v) for v in found):
+            detail = ""
+            if column == "Workload Options Sha256":
+                other = next(r for r in runs if not _same(r.get(column, ""), found[0]))
+                detail = _option_differences(runs[0], other, ("request_seed",))
+            problems.append(f"{label} differs between runs: {sorted(set(found))}" + (f" ({detail})" if detail else ""))
+        elif not found[0] and column in ("Workload Sha256", "Workload Options Sha256", "Llm Bench Version"):
             problems.append(f"{label} is missing from the summaries: not written by a warm-up-aware llm_bench")
     return problems
 
 
-def _numbers(rows: list[dict[str, str]], column: str) -> list[float]:
-    out = []
-    for row in rows:
-        try:
-            value = float(row.get(column, ""))
-        except ValueError:
-            continue
-        if math.isfinite(value):
-            out.append(value)
-    return out
+def _number(row: dict[str, str], column: str) -> Optional[float]:
+    try:
+        value = float(row.get(column, ""))
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
 
 
-def _spread(values: list[float], kind: str) -> float:
-    """How far a side's repeats scatter: (max - min) / mean, or max - min for fractions; 0 with one repeat."""
-    if len(values) < 2:
-        return 0.0
-    width = max(values) - min(values)
-    mean = sum(values) / len(values)
-    return width if kind == "abs" else (width / abs(mean) if mean else 0.0)
-
-
-MIN_REPEATS = 3  # a better / worse verdict needs this many repeats on each side
+MIN_REPEATS = 3  # a verdict needs this many pairs
 
 
 def compare(
     a: list[dict[str, str]], b: list[dict[str, str]], min_noise: float, min_repeats: int = MIN_REPEATS
 ) -> list[dict[str, Any]]:
+    """Per-metric verdicts from the pairs (a[i], b[i]); the rows are in pair order and as many on each side."""
     results = []
     for column, higher_is_better, kind in METRICS:
-        va, vb = _numbers(a, column), _numbers(b, column)
-        if not va or not vb:
+        pairs = [(_number(ra, column), _number(rb, column)) for ra, rb in zip(a, b)]
+        pairs = [(x, y) for x, y in pairs if x is not None and y is not None]
+        if not pairs:
             continue
-        mean_a, mean_b = sum(va) / len(va), sum(vb) / len(vb)
-        spread = max(_spread(va, kind), _spread(vb, kind))
-        noise = max(spread, min_noise)
-        if kind == "abs":
-            delta = mean_b - mean_a
-        elif mean_a:
-            delta = (mean_b - mean_a) / abs(mean_a)
-        elif mean_b:
-            kind, delta, noise = "abs", mean_b - mean_a, 0.0  # a relative change from 0 means nothing: the difference
+        if kind == "rel" and any(x == 0 and y != 0 for x, y in pairs):
+            kind = "abs"  # a relative change from 0 means nothing: the difference
+            absolute = True
         else:
-            delta = 0.0
-        if kind == "abs" and noise == 0.0 and delta:
-            verdict = "different"
+            absolute = False
+        deltas = [(y - x) if kind == "abs" else ((y - x) / abs(x) if x else 0.0) for x, y in pairs]
+        delta = sum(deltas) / len(deltas)
+        spread = max(deltas) - min(deltas) if len(deltas) > 1 else 0.0
+        noise = 0.0 if absolute else max(spread, min_noise)
+        if absolute:
+            verdict = "different" if delta else "same"
         elif abs(delta) <= noise:
-            verdict = "same" if noise <= 2 * min_noise else "inconclusive (noisy repeats)"
+            verdict = "same" if noise <= 2 * min_noise else "inconclusive (noisy pairs)"
         else:
             verdict = "better" if (delta > 0) == higher_is_better else "worse"
-        if min(len(va), len(vb)) < min_repeats:
-            # Two runs per side can't tell a change from run-to-run noise, and "same" and "different" are claims too
+        if len(pairs) < min_repeats:
+            # Too few pairs can't tell a change from run-to-run noise, and "same" and "different" are claims too
             verdict = "inconclusive (too few repeats)"
         results.append(
             {
                 "metric": column,
-                "a": mean_a,
-                "b": mean_b,
+                "a": sum(x for x, _ in pairs) / len(pairs),
+                "b": sum(y for _, y in pairs) / len(pairs),
                 "delta": delta,
                 "delta_kind": kind,
+                "pair_deltas": deltas,
                 "noise": noise,
-                "noise_from": "repeat spread" if spread > min_noise else "--min-noise",
+                "noise_from": "pair spread" if spread > min_noise and not absolute else "--min-noise",
                 "verdict": verdict,
-                "repeats_a": len(va),
-                "repeats_b": len(vb),
+                "pairs": len(pairs),
             }
         )
     return results
 
 
-def _format_delta(result: dict[str, Any]) -> str:
-    if result["delta"] is None:
-        return "n/a"
-    return f"{result['delta']:+.4f}" if result["delta_kind"] == "abs" else f"{100 * result['delta']:+.1f}%"
+def _format_delta(result: dict[str, Any], delta: Optional[float] = None) -> str:
+    delta = result["delta"] if delta is None else delta
+    return f"{delta:+.4f}" if result["delta_kind"] == "abs" else f"{100 * delta:+.1f}%"
 
 
 def flagged_runs(side: str, rows: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -214,16 +223,17 @@ def _flag_lines(flagged: list[dict[str, Any]]) -> list[str]:
 
 def markdown(results: list[dict[str, Any]], a_runs: int, b_runs: int, flagged: Optional[list] = None) -> str:
     lines = [
-        f"A: {a_runs} run(s), B: {b_runs} run(s)",
+        f"A: {a_runs} run(s), B: {b_runs} run(s), paired in order",
         "",
-        "| metric | A | B | delta | noise floor (from) | repeats A/B | verdict |",
-        "|---|---|---|---|---|---|---|",
+        "| metric | A | B | mean delta | noise floor (from) | pairs | per-pair deltas | verdict |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         noise = f"{r['noise']:.4f}" if r["delta_kind"] == "abs" else f"{100 * r['noise']:.1f}%"
+        per_pair = ", ".join(_format_delta(r, d) for d in r["pair_deltas"])
         lines.append(
             f"| {r['metric']} | {r['a']:.4g} | {r['b']:.4g} | {_format_delta(r)} | {noise} ({r['noise_from']}) "
-            f"| {r['repeats_a']}/{r['repeats_b']} | {r['verdict']} |"
+            f"| {r['pairs']} | {per_pair} | {r['verdict']} |"
         )
     return "\n".join(lines + [""] + _flag_lines(flagged or [])) + "\n"
 
@@ -237,7 +247,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--min-repeats",
         type=int,
         default=MIN_REPEATS,
-        help=f"Repeats each side needs for a better / worse verdict (default {MIN_REPEATS}); fewer reads inconclusive.",
+        help=f"Pairs needed for a verdict (default {MIN_REPEATS}); fewer reads inconclusive.",
     )
     parser.add_argument("--json", default=None, help="Write the comparison here as JSON.")
     parser.add_argument("--markdown", default=None, help="Write the comparison here as a markdown table.")

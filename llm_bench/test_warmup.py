@@ -576,23 +576,123 @@ def test_compare_refuses_when_the_workload_identity_differs(tmp_path, capsys, ch
     assert "Refusing to compare" in capsys.readouterr().err
 
 
-def test_compare_refuses_when_a_sides_repeats_disagree_or_the_identity_is_missing(tmp_path) -> None:
-    a = _summary(tmp_path / "a.csv", [{}, {"Warmup Requests": "121"}])
-    b = _summary(tmp_path / "b.csv", [{}])
-    assert compare.main(["--a", a, "--b", b]) == 2
+def test_compare_refuses_an_unmeasurable_identity(tmp_path, capsys) -> None:
     old = _summary(tmp_path / "old.csv", [{"Workload Sha256": "", "Llm Bench Version": ""}])
     assert compare.main(["--a", old, "--b", old]) == 2  # a summary from a client that doesn't write the identity
 
 
+def _pairs(tmp_path, n=3, a_extra=None, b_extra=None):
+    """n paired runs: pair i has seed 100 + i and warm-up requests 50 + i on both sides (as A_i's printed N_i)."""
+    a, b = [], []
+    for i in range(n):
+        ident = {"Request Seed": str(100 + i), "Warmup Requests": str(50 + i)}
+        a.append(_summary(tmp_path / f"a{i}.csv", [{**ident, **(a_extra(i) if a_extra else {})}]))
+        b.append(_summary(tmp_path / f"b{i}.csv", [{**ident, **(b_extra(i) if b_extra else {})}]))
+    return a, b
+
+
+def test_r1_runs_are_paired_each_pair_with_its_own_seed_and_warmup_count(tmp_path, capsys) -> None:
+    a, b = _pairs(tmp_path)  # three pairs with three seeds and three counts: refused before pairing existed
+    out = tmp_path / "out.json"
+    assert compare.main(["--a", *a, "--b", *b, "--json", str(out)]) == 0
+    assert json.loads(out.read_text())["metrics"][0]["pairs"] == 3
+
+
+def test_r1_runs_of_one_file_pair_in_row_order_and_the_counts_must_match(tmp_path, capsys) -> None:
+    rows_a = [{"Request Seed": str(i), "Warmup Requests": "7"} for i in range(3)]
+    a = _summary(tmp_path / "a.csv", rows_a)  # one summary file with all three runs (--summary-file appends rows)
+    b = _summary(tmp_path / "b.csv", rows_a)
+    assert compare.main(["--a", a, "--b", b]) == 0
+    short = _summary(tmp_path / "short.csv", rows_a[:2])
+    assert compare.main(["--a", a, "--b", short]) == 2
+    assert "A has 3 run(s) and B 2" in capsys.readouterr().err
+
+
+def test_r1_a_pair_whose_seed_or_warmup_count_differs_is_refused_and_named(tmp_path, capsys) -> None:
+    a, b = _pairs(tmp_path, b_extra=lambda i: {"Request Seed": "999"} if i == 1 else {})
+    assert compare.main(["--a", *a, "--b", *b]) == 2
+    assert "pair 2: request seed: A 101 vs B 999" in capsys.readouterr().err
+    a, b = _pairs(tmp_path, b_extra=lambda i: {"Warmup Requests": "1"} if i == 2 else {})
+    assert compare.main(["--a", *a, "--b", *b]) == 2
+    assert "pair 3: warm-up requests: A 52 vs B 1 (give B_i the --warmup-requests N_i" in capsys.readouterr().err
+
+
+def test_r1_a_seed_repeated_across_pairs_is_refused(tmp_path, capsys) -> None:
+    a, b = _pairs(tmp_path, a_extra=lambda i: {"Request Seed": "5"}, b_extra=lambda i: {"Request Seed": "5"})
+    assert compare.main(["--a", *a, "--b", *b]) == 2
+    err = capsys.readouterr().err
+    assert "request seed 5 is the same in pairs 1, 2, 3" in err and "resends the first run's prompts" in err
+
+
+def test_r1_the_workload_must_match_across_every_run_but_the_seed_may_differ_in_the_options(tmp_path, capsys) -> None:
+    a, b = _pairs(tmp_path, a_extra=lambda i: {"Workload Sha256": "other"} if i == 2 else {})
+    assert compare.main(["--a", *a, "--b", *b]) == 2  # pair 3's A differs from every other run
+    assert "workload file sha256 differs between runs" in capsys.readouterr().err
+    options = lambda seed: json.dumps({"qps_distribution": "gamma", "request_seed": seed})
+    a, b = _pairs(
+        tmp_path,
+        a_extra=lambda i: {"Workload Options": options(i), "Workload Options Sha256": "x"},
+        b_extra=lambda i: {
+            "Workload Options": options(i + 10).replace("gamma", "constant"),
+            "Workload Options Sha256": "y",
+        },
+    )
+    assert compare.main(["--a", *a, "--b", *b]) == 2
+    err = capsys.readouterr().err
+    assert "qps_distribution: A 'gamma' vs B 'constant'" in err and "request_seed" not in err
+
+
+def test_r1_verdicts_come_from_the_paired_deltas(tmp_path) -> None:
+    """Runs differ a lot from pair to pair (100, 200, 300) but B is 10% above A in each: a per-side spread would call
+    that noise; paired, the change is plain."""
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    a = [dict(ident, **{"P50 Total Latency": v}) for v in ("100", "200", "300")]
+    b = [dict(ident, **{"P50 Total Latency": v}) for v in ("110", "220", "330")]
+    (result,) = compare.compare(a, b, 0.03)
+    assert result["verdict"] == "worse" and result["pairs"] == 3 and result["noise_from"] == "--min-noise"
+    assert result["pair_deltas"] == pytest.approx([0.1, 0.1, 0.1]) and result["delta"] == pytest.approx(0.1)
+    # pairs that disagree set the floor: the spread of the per-pair deltas
+    b = [dict(ident, **{"P50 Total Latency": v}) for v in ("110", "200", "360")]  # +10%, 0%, +20%
+    (result,) = compare.compare(a, b, 0.03)
+    assert result["noise"] == pytest.approx(0.2) and result["noise_from"] == "pair spread"
+    assert result["verdict"] == "inconclusive (noisy pairs)"
+    # a pair is a pair: swapping B's order changes the deltas
+    (swapped,) = compare.compare(a, b[::-1], 0.03)
+    assert swapped["pair_deltas"] != result["pair_deltas"]
+
+
+def test_r1_the_output_lists_every_pairs_delta(tmp_path) -> None:
+    a, b = _pairs(
+        tmp_path,
+        a_extra=lambda i: {"P50 Total Latency": "100"},
+        b_extra=lambda i: {"P50 Total Latency": str(110 + 10 * i)},
+    )
+    md = tmp_path / "out.md"
+    assert compare.main(["--a", *a, "--b", *b, "--markdown", str(md)]) == 0
+    row = next(l for l in md.read_text().splitlines() if l.startswith("| P50 Total Latency |"))
+    assert "+10.0%, +20.0%, +30.0%" in row and "| 3 |" in row
+
+
 def test_compare_reports_deltas_against_the_noise_floor(tmp_path, capsys) -> None:
     a = [
-        _summary(tmp_path / f"a{i}.csv", [{"P50 Time To First Token": ttft, "Qps": qps, "Measured Hit Rate": "0.6"}])
+        _summary(
+            tmp_path / f"a{i}.csv",
+            [{"Request Seed": str(i), "P50 Time To First Token": ttft, "Qps": qps, "Measured Hit Rate": "0.6"}],
+        )
         for i, (ttft, qps) in enumerate([("100", "39.0"), ("110", "39.0"), ("105", "39.0")])
     ]
     b = [
         _summary(
             tmp_path / f"b{i}.csv",
-            [{"P50 Time To First Token": "150", "P99 Total Latency": "890", "Qps": "39.2", "Measured Hit Rate": "0.7"}],
+            [
+                {
+                    "Request Seed": str(i),
+                    "P50 Time To First Token": "150",
+                    "P99 Total Latency": "890",
+                    "Qps": "39.2",
+                    "Measured Hit Rate": "0.7",
+                }
+            ],
         )
         for i in range(3)
     ]
@@ -601,15 +701,15 @@ def test_compare_reports_deltas_against_the_noise_floor(tmp_path, capsys) -> Non
     assert compare.main(["--a", *a, "--b", *b, "--json", str(out), "--markdown", str(md)]) == 0
     by_metric = {m["metric"]: m for m in json.loads(out.read_text())["metrics"]}
     ttft = by_metric["P50 Time To First Token"]
-    assert ttft["verdict"] == "worse" and ttft["noise"] == pytest.approx(10 / 105)  # the repeats' spread beats 3%
-    assert ttft["noise_from"] == "repeat spread" and by_metric["Qps"]["noise_from"] == "--min-noise"
+    assert ttft["verdict"] == "worse" and ttft["noise"] == pytest.approx(0.5 - 150 / 110 + 1)  # +50%, +36%, +43%
+    assert ttft["noise_from"] == "pair spread" and by_metric["Qps"]["noise_from"] == "--min-noise"
     assert by_metric["Qps"]["verdict"] == "same"  # +0.5% against a 3% floor
     assert by_metric["P99 Total Latency"]["verdict"] == "same"  # -1.1%
     assert by_metric["Measured Hit Rate"]["verdict"] == "better" and by_metric["Measured Hit Rate"]["delta"] == (
         pytest.approx(0.1)
     )
     text = md.read_text()
-    assert "| P50 Time To First Token |" in text and "(repeat spread)" in text and "| 3/3 |" in text
+    assert "| P50 Time To First Token |" in text and "(pair spread)" in text and "| 3 |" in text
 
 
 def test_g3_a_better_or_worse_verdict_needs_three_repeats_per_side(tmp_path) -> None:
@@ -916,7 +1016,7 @@ def test_f9_compare_verdicts(tmp_path, capsys) -> None:
     verdict = {r["metric"]: r for r in compare.compare(noisy, steady, 0.03, min_repeats=2)}["P50 Total Latency"][
         "verdict"
     ]
-    assert verdict == "inconclusive (noisy repeats)"
+    assert verdict == "inconclusive (noisy pairs)"
     # runs that failed delivery or the failure ratio are flagged in the output
     a = _summary(tmp_path / "a.csv", [{}])
     b = _summary(
