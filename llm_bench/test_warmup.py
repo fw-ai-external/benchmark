@@ -446,7 +446,7 @@ def test_delivery_check_flags_a_short_rate_late_sends_and_failures() -> None:
     _timeline(on_time, on_time)
     entries, failures = delivery_entries(options, None, 0.0)
     assert failures == [] and entries["delivery_check"] == "pass"
-    assert entries["delivered_over_target"] == pytest.approx(1.0)
+    assert entries["delivered_over_intended"] == pytest.approx(1.0)
     slow = [i / 8 for i in range(101)]  # 8 QPS delivered against 10
     _timeline(on_time, slow)
     entries, failures = delivery_entries(options, None, 0.0)
@@ -481,7 +481,7 @@ def test_a_replays_late_row_share_and_rate_come_from_its_pacer() -> None:
         load_test.ScheduleEntry(offset=i * 0.1, class_index=0, index=i) for i in range(50)
     )  # 10 QPS of rows
     pacer = ReplayPacer(entries, "s.jsonl")
-    pacer.late_rows = 10
+    pacer.late_rows, pacer.sent_rows = 10, 50  # 50 rows were due when the run ended
     options = _run_options(MIX, qps=None, replay_schedule="s.jsonl", qps_min_delivered=0.95, max_late_share=0.05)
     options.max_fail_ratio, options.fail_on_delivery = 0.01, True
     _timeline([e.offset for e in entries], [e.offset for e in entries])
@@ -539,6 +539,7 @@ def test_a_run_that_did_not_deliver_exits_3_only_with_the_check_on(tmp_path, mon
 def _summary(path, rows) -> str:
     base = {
         "Workload Sha256": "abc",
+        "Workload Options Sha256": "opts",
         "Request Seed": "11",
         "Warmup Requests": "120",
         "Target Qps": "40.0",
@@ -561,6 +562,7 @@ def _summary(path, rows) -> str:
     "change",
     [
         {"Workload Sha256": "def"},
+        {"Workload Options Sha256": "other"},
         {"Request Seed": "12"},
         {"Warmup Requests": "130"},
         {"Target Qps": "50.0"},
@@ -666,3 +668,276 @@ def test_the_summary_row_has_the_warmup_fields_and_the_identity(tmp_path, monkey
     assert row["Llm Bench Version"] == load_test.LLM_BENCH_VERSION and row["Delivery Check"] == "off"
     # and compare reads exactly those columns
     assert {column for column, _ in compare.IDENTITY} <= set(row)
+
+
+# --- fix round 1 ---------------------------------------------------------------------------------------------------
+
+
+def test_f1_a_perfectly_delivered_random_run_never_fails_the_rate_check() -> None:
+    """A Poisson run's realized rate scatters around --qps; delivery is judged against its own intended schedule."""
+    options = _run_options(MIX, qps=2.0, qps_max_lateness=0.5, qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    for seed in range(60):
+        pacer = load_test.FixedQPSPacer(2.0, "exponential", 1.0, seed)
+        times = []
+        while (t := pacer.next_offset()) <= 60:
+            times.append(t)
+        _timeline(times, times)  # actual == intended: a perfect client
+        entries, failures = delivery_entries(options, None, 0.0)
+        assert failures == [], (seed, failures)
+        assert entries["delivered_over_intended"] == pytest.approx(1.0)
+
+
+def test_f1_late_share_and_rate_count_only_the_rows_due_when_the_run_ended() -> None:
+    entries = tuple(load_test.ScheduleEntry(offset=i * 0.1, class_index=0, index=i) for i in range(100))
+    pacer = ReplayPacer(entries, "s.jsonl")
+    pacer.sent_rows, pacer.late_rows = 20, 3  # -t cut the replay after 20 of 100 rows; 3 of those 20 were late
+    options = _run_options(MIX, qps=None, replay_schedule="s.jsonl", qps_min_delivered=0.95, max_late_share=0.05)
+    options.max_fail_ratio, options.fail_on_delivery = 0.01, True
+    due = [e.offset for e in entries[:20]]
+    _timeline(due, due)
+    summary, failures = delivery_entries(options, pacer, 0.0)
+    assert summary["late_send_share"] == pytest.approx(0.15)  # of the 20 due, not of the 100 rows
+    assert len(failures) == 1 and "late-send share" in failures[0]
+    # skipped rows were due and did not go out
+    pacer.late_rows, pacer.skipped_rows, SendTimeline.skipped = 0, 5, 5
+    summary, failures = delivery_entries(options, pacer, 0.0)
+    assert summary["delivered_over_intended"] == pytest.approx(20 / 25) and any("delivered" in f for f in failures)
+
+
+def _rows_with_session_context(second_lead_in_input: int) -> list[dict]:
+    """A session warmed up by one row (700 prompt tokens, a 20-token reply) and a lead-in, then a scored follow-up."""
+    return [
+        _row(-0.5, "s1", 700, 400, warmup=True, output_length=20),
+        _row(-0.1, "s1", second_lead_in_input, 0, lead_in=True),
+        _row(0.0, "s1", second_lead_in_input + 300, second_lead_in_input),
+    ]
+
+
+def test_f2_a_lead_in_of_the_prompt_plus_its_reply_is_covered_by_the_sent_prompt(
+    mock_server, sent_log, tmp_path
+) -> None:
+    host, _ = mock_server()
+    ds, entries, _ = _replay_run(tmp_path, host, WarmupPlan(), rows=_rows_with_session_context(720))  # 700 + 20
+    assert [(row, one_token) for row, one_token, *_ in sent_log] == [(0, False)]  # the lead-in (row 1) isn't resent
+    assert ds.lead_in_skipped == 1 and LeadIns.sent == 0
+
+
+def test_f2_a_lead_in_that_isnt_covered_continues_the_text_the_session_was_sent(
+    mock_server, sent_log, tmp_path
+) -> None:
+    host, _ = mock_server()
+    ds, entries, _ = _replay_run(tmp_path, host, WarmupPlan(), rows=_rows_with_session_context(900))
+    assert [(row, one_token) for row, one_token, *_ in sent_log] == [(0, False), (1, True)]
+    tokenizer = ds._tokenizer
+    warm, lead = (tokenizer.encode(prompt) for _, _, prompt, _ in sent_log)
+    assert _common_prefix(warm, lead) >= 700  # not fresh text: the whole warm-up prompt is held ahead of its tail
+
+
+def test_f3_either_hit_rate_may_be_absent_from_the_meta(tmp_path) -> None:
+    path = tmp_path / "s.jsonl"
+    rows = [dict(r, pod="p1" if i % 2 else "p2") for i, r in enumerate(REPLAY_ROWS)]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    (tmp_path / "s.jsonl.meta.json").write_text(
+        json.dumps({"warmup": {"hit_rate_by_pod": {"p1": 0.7}, "rows": 5, "source": "prod"}})
+    )
+    options = _run_options(REPLAY_MIX, replay_schedule=str(path), replay_pods=1, replay_pod_index=0, qps=None)
+    options.replay_retime = options.replay_schedule_meta = None
+    options.replay_retime_min_parent_gap = "off"
+    options.replay_pod = "p1"
+    assert warmup_plan(options).hit_rate == 0.7
+    options.replay_pod = "p2"  # no figure for this pod and no schedule-wide one: nothing to warm up to
+    assert warmup_plan(options) == WarmupPlan()
+
+
+def test_f4_a_replay_target_needs_no_cap_but_a_shape_mix_one_does(tmp_path) -> None:
+    path = tmp_path / "s.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in REPLAY_ROWS) + "\n")
+    (tmp_path / "s.jsonl.meta.json").write_text(json.dumps({"warmup": {"hit_rate": 0.5, "rows": 5}}))
+    options = _run_options(REPLAY_MIX, replay_schedule=str(path), replay_pods=1, replay_pod_index=0, qps=None)
+    options.replay_retime = options.replay_schedule_meta = options.replay_pod = None
+    options.replay_retime_min_parent_gap = "off"
+    plan = warmup_plan(options)
+    assert (plan.mode, plan.hit_rate, plan.cap_s) == ("target", 0.5, None)  # the warm-up rows bound it
+    options.prefix_fill = True  # the fill step doesn't warm up, whatever the meta says
+    assert warmup_plan(options) == WarmupPlan()
+    mix = dict(REPLAY_MIX, warmup={"hit_rate": 0.5, "source": "prod"})
+    options = _run_options(mix, prefix_fill=True)
+    assert warmup_plan(options) == WarmupPlan()  # nor does a mix file's block fail the fill run
+    with pytest.raises(ValueError, match="--warmup-cap-s"):
+        warmup_plan(_run_options(mix))
+    with pytest.raises(ValueError, match="could cut B's warm-up"):  # A's cap left on B's command line
+        warmup_plan(_run_options(MIX, warmup_requests=7, warmup_cap_s=5.0))
+
+
+def test_f4_a_replay_target_without_a_cap_runs_to_exhaustion(mock_server, sent_log, tmp_path) -> None:
+    host, _ = mock_server()
+    plan = WarmupPlan("target", hit_rate=0.999, tolerance=0.0, window_s=0.3, cap_s=None)
+    _replay_run(tmp_path, host, plan)
+    assert Warmup.reason == "exhausted" and Warmup.requests == 5
+
+
+def test_f5_a_lead_in_completes_before_its_sessions_next_row_but_other_sessions_go_on(monkeypatch, tmp_path) -> None:
+    timeline = {}
+    post = UnscoredSender.post
+
+    def slow(self, request, one_token=False):
+        start = time.monotonic()
+        if one_token:
+            time.sleep(0.4)  # a slow lead-in (the real one is a request to the server)
+        timeline[request.schedule_row] = (start, time.monotonic())
+        return (request.prompt_tokens, 0)
+
+    # gevent-patched sleep: the other sessions' sends run while this one waits
+    monkeypatch.setattr(UnscoredSender, "post", slow)
+    host = "http://127.0.0.1:9"
+    _replay_run(tmp_path, host, WarmupPlan("requests", requests=5, window_s=0.3))
+    lead_end = timeline[2][1]  # row 2: the lead-in of session s3; row 3: s3's warm-up row; row 4: session s4's
+    assert timeline[3][0] >= lead_end - 0.01  # s3's row waits for its lead-in
+    assert timeline[4][0] < lead_end  # s4's goes out meanwhile
+    assert post  # the unpatched sender is what the other tests use
+
+
+def test_f6_a_run_given_the_count_makes_the_same_lead_in_decisions_as_the_run_that_reported_it(
+    mock_server, sent_log, tmp_path
+) -> None:
+    # a lead-in for s4 sits just before s4's first warm-up row; a target run that stops at that row drops both
+    rows = REPLAY_ROWS[:5] + [_row(-0.45, "s4", 800, 400, lead_in=True)] + REPLAY_ROWS[5:]
+    host_a, _ = mock_server()
+    plan = WarmupPlan("target", hit_rate=0.2, tolerance=0.0, window_s=0.6, cap_s=60.0)
+    _replay_run(tmp_path, host_a, plan, rows=rows)
+    n, dropped = Warmup.requests, LeadIns.dropped
+    a_sent = sorted((row, one_token) for row, one_token, *_ in sent_log)  # the same sends (their order may vary)
+    assert Warmup.reason == "target" and 0 < n < 5
+    sent_log.clear()
+    LeadIns.sent = LeadIns.dropped = 0
+    host_b, _ = mock_server()
+    _replay_run(tmp_path, host_b, WarmupPlan("requests", requests=n, window_s=0.6), rows=rows)
+    assert sorted((row, one_token) for row, one_token, *_ in sent_log) == a_sent and LeadIns.dropped == dropped
+    assert dropped == 1 and (5, True) not in a_sent  # lead-in row 5, for s4, went with s4's dropped row
+
+
+def test_f7_a_warmup_whose_rows_were_all_sent_waits_out_the_gap_to_time_0_however_it_ended(
+    mock_server, sent_log, tmp_path
+) -> None:
+    host, _ = mock_server()
+    # the cap passes while the lead-in after the last warm-up row is due: every warm-up row had been sent
+    plan = WarmupPlan("target", hit_rate=0.999, tolerance=0.0, window_s=0.3, cap_s=0.8)
+    _, _, took_a = _replay_run(tmp_path, host, plan)
+    assert (Warmup.reason, Warmup.requests) == ("exhausted", 5) and took_a >= 0.85
+    host_b, _ = mock_server()
+    _, _, took_b = _replay_run(tmp_path, host_b, WarmupPlan("requests", requests=5, window_s=0.3))
+    assert Warmup.reason == "requests" and took_b >= 0.85  # B with the same count takes the same branch
+
+
+def test_f8_the_workload_options_are_reported_and_every_name_is_a_real_option() -> None:
+    parser = argparse.ArgumentParser()
+    load_test.init_parser(parser)
+    dests = {a.dest for a in parser._actions}
+    assert set(load_test.WORKLOAD_OPTIONS) <= dests
+    options = _run_options(MIX, replay_pod=None, replay_retime=None, tokenizer=None)
+    base = load_test.workload_options(options)
+    for name, value in [
+        ("replay_pod", "p2"),
+        ("replay_pods", 2),
+        ("replay_pod_index", 1),
+        ("replay_retime", "poisson"),
+        ("qps_distribution", "gamma"),
+        ("qps_cv2", 4.0),
+        ("qps_dispersion", 3.0),
+        ("shape_mix_corpus", "x.txt"),
+        ("tokenizer", "other"),
+        ("shape_mix_sample_lengths", True),
+        ("shape_mix_output_mode", "max"),
+        ("max_tokens", 10),
+        ("reasoning_effort", "low"),
+    ]:
+        assert load_test.workload_options(_run_options(MIX, **{name: value})) != base, name
+    chat = _run_options(MIX, replay_pod=None, replay_retime=None, tokenizer=None)
+    chat.chat = True
+    assert load_test.workload_options(chat) != base
+    load_test.InitTracker.deferred_run_time_seconds = 600
+    try:
+        assert load_test.workload_options(options) != base  # -t
+    finally:
+        load_test.InitTracker.deferred_run_time_seconds = None
+
+
+def test_f8_compare_names_the_options_that_differ_and_ignores_non_measured_rows(tmp_path, capsys) -> None:
+    a = _summary(tmp_path / "a.csv", [{"Workload Options": json.dumps({"qps_distribution": "gamma"})}])
+    b = _summary(
+        tmp_path / "b.csv",
+        [{"Workload Options": json.dumps({"qps_distribution": "constant"}), "Workload Options Sha256": "z"}],
+    )
+    assert compare.main(["--a", a, "--b", b]) == 2
+    assert "qps_distribution: A 'gamma' vs B 'constant'" in capsys.readouterr().err
+    # a --prefix-fill step's row (another seed, no hit rate) is no run: left out of the comparison, and said so
+    fill = _summary(tmp_path / "fill.csv", [{"Mode": "prefix_fill", "Request Seed": "99", "Qps": "1"}])
+    ok = _summary(tmp_path / "ok.csv", [{}])
+    assert compare.main(["--a", ok, fill, "--b", ok]) == 0
+    assert "ignoring" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="no measured summary rows"):
+        compare.read_rows([fill])
+
+
+def test_f9_compare_verdicts(tmp_path, capsys) -> None:
+    ident = {c: "1" for c, _ in compare.IDENTITY}
+    zero_a = [dict(ident, **{"Requests Failed": "0", "Fail Ratio": "0", "P50 Total Latency": "100"})]
+    zero_b = [dict(ident, **{"Requests Failed": "250", "Fail Ratio": "0.025", "P50 Total Latency": "100"})]
+    by = {r["metric"]: r for r in compare.compare(zero_a, zero_b, 0.03)}
+    assert by["Requests Failed"]["verdict"] == "different" and by["Requests Failed"]["delta"] == 250
+    assert by["Requests Failed"]["delta_kind"] == "abs"  # the difference, not a relative change from 0
+    assert by["P50 Total Latency"]["verdict"] == "same"
+    # a noisy side swallows the delta: not "same"
+    noisy = [dict(ident, **{"P50 Total Latency": v}) for v in ("100", "160")]
+    steady = [dict(ident, **{"P50 Total Latency": v}) for v in ("131", "132")]
+    verdict = {r["metric"]: r for r in compare.compare(noisy, steady, 0.03)}["P50 Total Latency"]["verdict"]
+    assert verdict == "inconclusive (noisy repeats)"
+    # runs that failed delivery or the failure ratio are flagged in the output
+    a = _summary(tmp_path / "a.csv", [{}])
+    b = _summary(
+        tmp_path / "b.csv", [{"Delivery Check": "fail", "Delivery Failures": "late-send share 0.2", "Failed": "1"}]
+    )
+    out = tmp_path / "out.json"
+    assert compare.main(["--a", a, "--b", b, "--json", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "!!! B run 1: delivery check failed (late-send share 0.2); exceeded --max-fail-ratio" in printed
+    assert json.loads(out.read_text())["flagged_runs"][0]["side"] == "B"
+
+
+def test_f10_processes_with_a_warmup_is_refused() -> None:
+    options = argparse.Namespace(
+        shape_mix=json.dumps(MIX),
+        chat=False,
+        tokenizer=None,
+        shape_mix_corpus=None,
+        prefix_reuse_overhang=128,
+        qps=5.0,
+        processes=2,
+        warmup_requests=5,
+    )
+    with pytest.raises(ValueError, match="--processes N with a warm-up"):
+        load_test.validate_shape_mix_options(options)
+    options.warmup_requests, options.processes = None, 2
+    load_test.validate_shape_mix_options(options)  # no warm-up: processes as before
+    options.warmup_requests, options.processes = 5, 1
+    load_test.validate_shape_mix_options(options)
+
+
+def test_f11_warmup_draws_leave_the_measured_counters_alone() -> None:
+    ds = _dataset(MIX, tokenizer=WordTokenizer(), context_tokens=302)  # every 300 + 4 token request is cut to fit
+    ds.build_prefixes()
+    for _ in range(5):
+        assert ds.warmup_request().generated_tokens == 2
+    assert ds.context_cut_requests == 0
+    next(ds)
+    assert ds.context_cut_requests == 1
+
+
+def test_f11_the_last_window_is_over_the_full_window_whenever_it_is_asked() -> None:
+    window = HitRateWindow(10.0)
+    for at, cached in ((1.0, 0), (6.0, 100), (11.0, 100), (14.0, 100)):
+        window.add(at, 100, cached)
+    assert window.rate(14.0) == pytest.approx(1.0)  # [4, 14]: three responses, all hits
+    assert window.rate(11.0) == pytest.approx(2 / 3)  # [1, 11]: asked later, an earlier window is still whole
+    assert window.rate(14.0) == pytest.approx(1.0)

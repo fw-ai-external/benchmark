@@ -2210,7 +2210,7 @@ class ShapeMixDataset:
             if self.sample_lengths and cls.uncached_tokens_quantiles and variant is None:
                 drawn = self._uncached_dist[ci].value(self._stratum(ci, "uncached", stream, tag).next())
                 tail_tokens = self._tail_for_uncached(ci, drawn)
-        return self._render(ci, prefix_index, nonce, counter, variant, generated, tail_tokens)
+        return self._render(ci, prefix_index, nonce, counter, variant, generated, tail_tokens, warm)
 
     def _draw_variant(self, ci: int, rng: random.Random, stratum=None) -> Optional[int]:
         count = len(self._filler_tokens[ci])
@@ -2309,6 +2309,9 @@ class ShapeMixDataset:
         self._replay_sources: dict[str, list] = {}  # session -> previous prompt + "\n\n" + synthetic reply
         self.lead_in_skipped = 0
         self._replay_pool_sent: dict[tuple, int] = {}  # (class, prefix) -> longest pool cut sent so far
+        # With warm-up rows, lead-ins are decided as they are sent, and one that continues a session already sent
+        # (see _plan_row, _lead_in_covered) is laid out and covered as such
+        self._warm_schedule = incremental
         self.replay_layout_seconds = time.perf_counter() - started
         if not incremental:
             self.lay_out_replay_rows(entries)
@@ -2328,7 +2331,9 @@ class ShapeMixDataset:
         prompts, plan = self._replay_prompts, self._plan_row(
             entry, self._replay_prompts.get(session), self._replay_sources.get(session)
         )
-        if entry.lead_in and self._lead_in_covered(entry, plan, prompts.get(session), self._replay_pool_sent):
+        if entry.lead_in and self._lead_in_covered(
+            entry, plan, prompts.get(session), self._replay_pool_sent, self._replay_sources.get(session)
+        ):
             # Something earlier already holds this text: don't send it, and don't count it as sent
             plan["skip"] = True
             self.lead_in_skipped += 1
@@ -2372,6 +2377,14 @@ class ShapeMixDataset:
         pool_tokens = self.prefix_tokens[ci] if pool else 0
         recorded = entry.cached_length
         want = self._replay_want(entry)  # None: the class's cached share, or a session's whole source
+        prompt = entry.input_length
+        content = None if prompt is None else prompt - self._replay_sizing_overhead
+        if self._warm_schedule and entry.lead_in and previous and want is not None and content is not None:
+            # A lead-in for a session already sent (its earlier context lies outside the window, but the warm-up sent
+            # its first rows) continues the text sent, up to the room its own nonce tail needs: not fresh text, which
+            # would leave the session's first scored row nothing of the warm-up to reuse
+            room = max(0, content - self._min_tail_tokens_for(SHAPE_MIX_TAIL_START) - 2)
+            want = max(want, min(sum(self._segment_tokens(seg) for seg in previous), room))
         # The restore margin and a positive reuse overhang are headroom, not requirements: an earlier prompt covering
         # the recorded (aligned) length itself will do. Asking a session's prompts for cached + overhang made a lead-in
         # recorded exactly cached tokens long never "cover", so the session's first row fell through to the pool and
@@ -2387,8 +2400,6 @@ class ShapeMixDataset:
         if want is None:
             want = sum(self._segment_tokens(seg) for seg in source)
         output = entry.output_length or cls.generated_tokens
-        prompt = entry.input_length
-        content = None if prompt is None else prompt - self._replay_sizing_overhead
         if content is not None:
             want = min(want, max(0, content - self._bare_min()))
         segments, reused = self._cut(source, want)
@@ -2468,15 +2479,31 @@ class ShapeMixDataset:
             "designed": None if unscored else max(0, reusable),
         }
 
-    def _lead_in_covered(self, entry: "ScheduleEntry", plan: dict, prompts: Optional[list], pool_sent: dict) -> bool:
+    def _lead_in_covered(
+        self,
+        entry: "ScheduleEntry",
+        plan: dict,
+        prompts: Optional[list],
+        pool_sent: dict,
+        previous: Optional[list] = None,
+    ) -> bool:
         """A lead-in is covered, and not sent, when
         - an earlier sent prompt of its own session is at least as long (the session's private text is held), or
+          with warm-up rows, the session's last sent prompt plus its reply (`previous`: what a recorded follow-up
+          continues, so a lead-in of the prompt plus the reply, 7002 + 20 tokens, is held too), or
         - it is a shared-prefix warm-up (cached_length == input_length: nothing private) and an earlier row, of any
           session, already sent that class pool cut at least as long (D-50: shared prefixes are cross-session).
         A remainder lead-in (cached_length < input_length: the shared part plus the session's own context) always
         carries private text, so only the first rule can cover it."""
         content = plan["prompt_tokens"] - self._replay_template
         if entry.session is not None and any(tokens >= content for _, tokens in prompts or ()):
+            return True
+        if (
+            self._warm_schedule
+            and entry.session is not None
+            and previous
+            and sum(self._segment_tokens(seg) for seg in previous) >= content
+        ):
             return True
         shared_only = entry.session is None or (
             entry.cached_length is not None and entry.cached_length >= entry.input_length
@@ -2857,7 +2884,9 @@ class ShapeMixDataset:
         request = self._render(class_index, prefix_index, nonce, counter, variant, 1)
         return request
 
-    def _render(self, ci, prefix_index, nonce, counter, variant, generated_tokens, tail_tokens=None) -> ShapeRequest:
+    def _render(
+        self, ci, prefix_index, nonce, counter, variant, generated_tokens, tail_tokens=None, warm=False
+    ) -> ShapeRequest:
         cls = self.classes[ci]
         pool_size = self.pool_sizes[ci]
         prefix = self.prefix(ci, prefix_index) if pool_size else ""
@@ -2881,7 +2910,8 @@ class ShapeMixDataset:
         if self.context_tokens and prompt_tokens + generated_tokens > self.context_tokens:
             # A sampled long prompt with a sampled long output: cut the output to fit the context (counted)
             generated_tokens = max(1, self.context_tokens - prompt_tokens)
-            self.context_cut_requests += 1
+            if not warm:  # a warm-up request's cut isn't the measured phase's
+                self.context_cut_requests += 1
         return ShapeRequest(
             prompt=prefix + tail,
             prompt_tokens=prompt_tokens,
@@ -4495,29 +4525,41 @@ def idle_rule_gap_cv2(times) -> Optional[float]:
 
 
 def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> tuple[dict[str, Any], list[str]]:
-    """The measured phase's delivery figures and what fails --fail-on-delivery: the delivered send rate against the
-    target (--qps, or the schedule's own rate), the share of sends that went out late (or were skipped), and the
-    failed-request share. Returns (summary entries, the failed checks)."""
+    """The measured phase's delivery figures and what fails --fail-on-delivery.
+
+    The rate is judged against the schedule the run intended, not the nominal --qps: a Poisson or gamma run's realized
+    rate scatters around it (a perfect client delivered 1 in 5 of 120 s exponential runs below 95%). So the delivered
+    rate is the sends' span on the intended schedule over their span on the wire (1 for a client that sent each on
+    time, less if it fell behind), times the share of the sends due in the window that went out (skipped ones did
+    not). Sends not yet due when the run ended (a replay cut by -t) are not counted. The late share is over the same
+    due sends. Returns (summary entries, the failed checks)."""
     replaying = bool(getattr(options, "replay_schedule", None))
-    actual = sorted(SendTimeline.actual)
-    span = actual[-1] - actual[0] if len(actual) > 1 else 0.0
-    delivered = (len(actual) - 1) / span if span > 0 else None
+    intended, actual = list(SendTimeline.intended), list(SendTimeline.actual)
+    sent, skipped = len(actual), SendTimeline.skipped
+    span = max(actual) - min(actual) if sent > 1 else 0.0
+    intended_span = max(intended) - min(intended) if sent > 1 else 0.0
+    delivered = (sent - 1) / span if span > 0 else None
+    intended_qps = (sent - 1) / intended_span if intended_span > 0 else None
+    went_out = sent / (sent + skipped) if sent else None
+    ratio = (intended_span / span) * went_out if span > 0 and intended_span > 0 else None
     if replaying:
         offsets = [e.offset for e in pacer.entries] if pacer is not None else []
         target_span = offsets[-1] - offsets[0] if len(offsets) > 1 else 0.0
         target = (len(offsets) - 1) / target_span if target_span > 0 else None
-        late_share = pacer.late_rows / len(offsets) if offsets else 0.0
+        due = (pacer.sent_rows + pacer.skipped_rows) if pacer is not None else 0
+        late_share = pacer.late_rows / due if due else 0.0
     else:
         target = getattr(options, "qps", None)
         max_late = getattr(options, "qps_max_lateness", DEFAULT_MAX_LATENESS_SECONDS)
-        late = sum(1 for i, a in zip(SendTimeline.intended, SendTimeline.actual) if a - i > max_late)
-        total = len(actual) + SendTimeline.skipped
-        late_share = (late + SendTimeline.skipped) / total if total else 0.0
-    ratio = delivered / target if delivered is not None and target else None
+        late = sum(1 for i, a in zip(intended, actual) if a - i > max_late)
+        late_share = (late + skipped) / (sent + skipped) if sent + skipped else 0.0
     failures = []
     minimum = getattr(options, "qps_min_delivered", 0.95)
     if ratio is not None and ratio < minimum:
-        failures.append(f"delivered {delivered:.3f} QPS of a target {target:.3f} ({ratio:.3f} < {minimum:g})")
+        failures.append(
+            f"delivered {delivered:.3f} QPS against {intended_qps:.3f} intended by its schedule "
+            f"({ratio:.3f} < {minimum:g})"
+        )
     if late_share > getattr(options, "max_late_share", 0.05):
         failures.append(f"late-send share {late_share:.3f} > {getattr(options, 'max_late_share', 0.05):g}")
     if fail_ratio > getattr(options, "max_fail_ratio", 0.01):
@@ -4527,12 +4569,33 @@ def delivery_entries(options: argparse.Namespace, pacer, fail_ratio: float) -> t
         enabled = Warmup.mode != "none"
     return {
         "delivered_qps": "" if delivered is None else delivered,
+        "intended_qps": "" if intended_qps is None else intended_qps,
         "target_qps": "" if not target else target,
-        "delivered_over_target": "" if ratio is None else ratio,
+        "delivered_over_intended": "" if ratio is None else ratio,
         "late_send_share": late_share,
         "delivery_check": ("fail" if failures else "pass") if enabled else "off",
         "delivery_failures": "; ".join(failures),
     }, (failures if enabled else [])
+
+
+# Options that change the traffic a run sends (beyond the workload files): two runs only compare if these agree.
+# Not the deployment (--model, --provider, the host) or what only reports
+WORKLOAD_OPTIONS = (
+    "replay_pod replay_pods replay_pod_index replay_retime replay_retime_min_parent_gap replay_template_subtraction "
+    "replay_pool_prefix replay_late_rows qps qps_distribution qps_cv2 qps_dispersion qps_modulation_window "
+    "shape_mix_corpus shape_mix_instruction shape_mix_output_mode shape_mix_sample_lengths shape_mix_tail_variants "
+    "tokenizer chat chat_head_tokens prefix_popularity_zipf prefix_restore_boundary prefix_reuse_overhang "
+    "served_model_config max_tokens max_tokens_cap max_tokens_distribution max_tokens_range prompt_tokens "
+    "reasoning_effort temperature top_k n stream ignore_eos force_min_tokens logprobs cancel_rate lora_adapters"
+).split()
+
+
+def workload_options(options: argparse.Namespace) -> str:
+    """The options in WORKLOAD_OPTIONS (and -t, which Locust's own option is cleared into the deferred run time) as
+    sorted JSON, for the summary: what differs between two runs that saw different traffic."""
+    values = {name: getattr(options, name, None) for name in WORKLOAD_OPTIONS}
+    values["run_time_s"] = InitTracker.deferred_run_time_seconds
+    return json.dumps({k: values[k] for k in sorted(values)}, default=str)
 
 
 def workload_sha256(options: argparse.Namespace) -> str:
@@ -5009,6 +5072,7 @@ def validate_shape_mix_options(options: argparse.Namespace) -> None:
             f"--served-model-config <its config> or --prefix-reuse-overhang <tokens>, or measure the engine with "
             f"--prefix-reuse-probe (a family outside the measured table is a warning until probed)."
         )
+    schedule: tuple = ()
     if getattr(options, "replay_schedule", None):
         pods, pod_index = getattr(options, "replay_pods", 1), getattr(options, "replay_pod_index", 0)
         if pods < 1 or not 0 <= pod_index < pods:
@@ -5023,7 +5087,15 @@ def validate_shape_mix_options(options: argparse.Namespace) -> None:
                     f"--replay-schedule: prefix_index {entry.prefix_index} is outside class {cls.name}'s pool of "
                     f"{pool}" + ("" if pool else " (the class has no shared prefix)")
                 )
-    warmup_plan(options)  # a bad warm-up flag or workload block fails here, before anything is built
+    plan = warmup_plan(options)  # a bad warm-up flag or workload block fails here, before anything is built
+    warm_rows = any(e.warmup for e in schedule)
+    if getattr(options, "processes", None) not in (None, 0, 1) and (
+        plan.mode != "none" or (warm_rows and not getattr(options, "no_warmup", False))
+    ):
+        raise ValueError(
+            "--processes N with a warm-up: each process would warm up on its own and no single --warmup-requests N "
+            "reproduces it; run one process, or give B --no-warmup and warm both by another way"
+        )
     overhead = 0
     if options.chat:
         tokenizer = InitTracker.load_tokenizer(options.tokenizer)
@@ -5289,8 +5361,8 @@ def read_replay_meta_warmup(options: argparse.Namespace) -> Optional[dict]:
 def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     """The run's warm-up: the CLI's (--warmup-hit-rate, or --warmup-requests), else the workload file's "warmup" block
     (the mix file's with --shape-mix, the schedule meta's with --replay-schedule), unless --no-warmup. No flag and no
-    block: no warm-up, and the run is as it was before warm-ups existed. A target needs --warmup-cap-s; a warm-up
-    at the run's rate needs --qps (a replay has its own times)."""
+    block: no warm-up, and the run is as it was before warm-ups existed. A shape-mix target needs --warmup-cap-s (a
+    replay's warm-up rows bound it) and a warm-up at the run's rate needs --qps (a replay has its own times)."""
     target = getattr(options, "warmup_hit_rate", None)
     count = getattr(options, "warmup_requests", None)
     explicit = target is not None or count is not None
@@ -5300,13 +5372,20 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
         return WarmupPlan()
     if target is not None and count is not None:
         raise ValueError("--warmup-hit-rate and --warmup-requests are mutually exclusive")
-    if explicit and getattr(options, "prefix_fill", False):
+    cap_s = getattr(options, "warmup_cap_s", None)
+    if count is not None and cap_s is not None:
         raise ValueError(
-            "--prefix-fill is its own step and quits when done; give the warm-up flags to the measured run"
+            "--warmup-cap-s goes with a --warmup-hit-rate target; with --warmup-requests it could cut B's warm-up "
+            "short of the count A reported"
         )
+    if getattr(options, "prefix_fill", False):
+        if explicit:
+            raise ValueError(
+                "--prefix-fill is its own step and quits when done; give the warm-up flags to the measured run"
+            )
+        return WarmupPlan()  # the fill step doesn't warm up, whatever the workload file's block says
     tolerance = getattr(options, "warmup_tolerance", DEFAULT_WARMUP_TOLERANCE)
     window_s = getattr(options, "warmup_window_s", DEFAULT_WARMUP_WINDOW_S)
-    cap_s = getattr(options, "warmup_cap_s", None)
     if tolerance < 0 or window_s <= 0 or (cap_s is not None and cap_s <= 0):
         raise ValueError("--warmup-tolerance must be >= 0, and --warmup-window-s and --warmup-cap-s > 0")
     if target is not None and not 0 <= target <= 1:
@@ -5322,23 +5401,26 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
     source = "cli"
     if target is None and not getattr(options, "no_warmup", False):
         block = read_replay_meta_warmup(options) if replaying else parse_shape_mix(options.shape_mix).warmup
-        if block is not None and block.get("hit_rate") is not None:
-            target, source = block["hit_rate"], block.get("source") or "file"
+        if block is not None:
+            # Either hit rate may be absent: the replayed pod's own figure, else the schedule's
+            found = block.get("hit_rate")
             by_pod = block.get("hit_rate_by_pod") or {}
             if replaying and by_pod:
                 names = tuple(c.name for c in parse_shape_mix(options.shape_mix).classes)
                 pods = {e.pod for e in replay_entries(options, names) if e.pod is not None}
                 if len(pods) == 1 and next(iter(pods)) in by_pod:
-                    target = by_pod[next(iter(pods))]  # the replayed pod's own figure, else the schedule's
-            if not replaying and getattr(options, "qps", None) is None:
-                logger.warning(
-                    "--shape-mix's warmup block is not used: warming up sends the mix at the run's rate and there is "
-                    "no --qps"
-                )
-                return WarmupPlan()
+                    found = by_pod[next(iter(pods))]
+            if found is not None:
+                if not replaying and getattr(options, "qps", None) is None:
+                    logger.warning(
+                        "--shape-mix's warmup block is not used: warming up sends the mix at the run's rate and "
+                        "there is no --qps"
+                    )
+                    return WarmupPlan()
+                target, source = found, block.get("source") or "file"
     if target is None:
         return WarmupPlan()
-    if cap_s is None:
+    if cap_s is None and not replaying:
         raise ValueError(
             f"a warm-up to hit rate {target:g} ({source}) needs --warmup-cap-s, the seconds after which it stops "
             f"anyway (or --warmup-requests N for a fixed count, or --no-warmup to skip the file's)"
@@ -5348,13 +5430,15 @@ def warmup_plan(options: argparse.Namespace) -> WarmupPlan:
 
 class HitRateWindow:
     """The prompt-cache hit rate the client measures from response usage: cached prompt tokens over prompt tokens, of
-    the responses that completed in the last `window_s` seconds. Responses that report no cached count are left out
-    (counted in `unreported`)."""
+    the responses that completed in the `window_s` seconds up to a given time. Responses that report no cached count
+    are left out (counted in `unreported`). Nothing is dropped as time passes, so the rate at an earlier time (the
+    stop check) and at a later one (the summary's last window) are each over their full window."""
 
     def __init__(self, window_s: float) -> None:
         self.window_s = window_s
-        self._events: deque = deque()
-        self._prompt = self._cached = 0
+        self._times: list[float] = []  # completion times, in order
+        self._prompt = [0]  # running sums: _prompt[i] is the prompt tokens of the first i responses
+        self._cached = [0]
         self.latest: Optional[float] = None
         self.unreported = 0
 
@@ -5362,17 +5446,16 @@ class HitRateWindow:
         if cached_tokens is None:
             self.unreported += 1
             return
-        self._events.append((at, prompt_tokens, cached_tokens))
-        self._prompt += prompt_tokens
-        self._cached += cached_tokens
+        self._times.append(at)
+        self._prompt.append(self._prompt[-1] + prompt_tokens)
+        self._cached.append(self._cached[-1] + cached_tokens)
         self.latest = at
 
     def rate(self, now: float) -> Optional[float]:
-        while self._events and self._events[0][0] < now - self.window_s:
-            _, prompt, cached = self._events.popleft()
-            self._prompt -= prompt
-            self._cached -= cached
-        return self._cached / self._prompt if self._prompt > 0 else None
+        high = bisect.bisect_right(self._times, now)
+        low = bisect.bisect_left(self._times, now - self.window_s)
+        prompt = self._prompt[high] - self._prompt[low]
+        return (self._cached[high] - self._cached[low]) / prompt if prompt > 0 else None
 
 
 class Warmup:
@@ -5574,16 +5657,21 @@ def run_shape_mix_warmup(environment, options: argparse.Namespace, ds: "ShapeMix
 
 
 def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDataset", plan: WarmupPlan) -> None:
-    """Replay the schedule's warm-up rows (and its lead-ins) at their recorded negative times, unscored, before time 0.
+    """Replay the schedule's warm-up rows (and its lead-ins) before time 0, unscored.
 
-    The rows before time 0 go out in time order, interleaved. A lead-in is sent only if what was actually sent
-    before it doesn't cover it (decided as each row is laid out, ShapeMixDataset.lay_out_replay_row). With a hit-rate
-    target the warm-up stops once it is reached, with --warmup-requests N after the first N warm-up rows; the warm-up
-    rows left are dropped, and so are the lead-ins that came just before a dropped row of their session (they would
-    prime context only that row uses). The lead-ins still ahead (a scored session's earlier context, which the
-    dropped rows would have provided) go out at once, if not covered. Then the measured rows are laid out against
-    what was sent, and the run window starts now. A schedule whose warm-up is not stopped early waits out the
-    recorded gap to time 0 first."""
+    The warm-up rows go out at their recorded (negative) times. A lead-in is held until the next warm-up row goes out,
+    then sent just ahead of it (a lead-in for a session that began in the warm-up sits just before that session's
+    first row, so it is sent just before it), unless what was actually sent before it already covers it (decided as
+    each row is laid out, ShapeMixDataset.lay_out_replay_row). A lead-in finishes before its session's next row goes
+    out; sessions are concurrent.
+
+    With a hit-rate target the warm-up stops once it is reached, with --warmup-requests N it sends the first N warm-up
+    rows in schedule order; the cut is before the next warm-up row either way, so a run given N makes the decisions
+    the run that reported N made: the rows left are dropped, and so are the lead-ins ahead of a dropped row of their
+    session (they prime context only that row uses); the other lead-ins still ahead (a scored session's earlier
+    context, which the dropped rows would have provided) go out at once, if not covered. If every warm-up row was
+    sent, the recorded gap to time 0 is waited out; else the measured window starts at once. Then the measured rows are
+    laid out against what was sent."""
     names = tuple(c.name for c in ds.mix.classes)
     entries = replay_entries(options, names)
     staged = [e for e in entries if e.lead_in or e.warmup]
@@ -5613,45 +5701,53 @@ def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDat
         else:
             LeadIns.sent += 1
 
+    lead_chain: dict = {}  # session -> the greenlet of its latest lead-in send
+
+    def after(prior, send, request: ShapeRequest) -> None:
+        if prior is not None:
+            prior.join()  # a session's lead-in completes before the session's next row goes out
+        send(request)
+
+    def send_lead_in(entry: "ScheduleEntry") -> None:
+        if ds.lay_out_replay_row(entry):
+            greenlet = group.spawn(after, lead_chain.get(entry.session), lead_send, ds.replay_request(entry))
+            if entry.session is not None:
+                lead_chain[entry.session] = greenlet
+
     started = time.monotonic()
     first = staged[0].offset
     logger.info(
         f"--replay-schedule: warming up with {warm_rows} recorded rows ({LeadIns.rows} lead-ins) over "
         f"{-first:.0f}s before time 0: "
         + (
-            f"until the hit rate over {plan.window_s:g}s reaches {plan.hit_rate:g} - {plan.tolerance:g} (cap "
-            f"{plan.cap_s:g}s)"
+            f"until the hit rate over {plan.window_s:g}s reaches {plan.hit_rate:g} - {plan.tolerance:g}"
+            + (f" (cap {plan.cap_s:g}s)" if plan.cap_s is not None else "")
             if plan.mode == "target"
             else f"the first {limit} warm-up rows"
         )
     )
-    last_warm = {e.session: n for n, e in enumerate(staged) if e.warmup}  # a session's last warm-up row
     sent, cut, reason = 0, None, None
+    held: list[tuple[int, ScheduleEntry]] = []  # (position, lead-in) since the last warm-up row sent
     for position, entry in enumerate(staged):
-        if entry.warmup and limit is not None and sent >= limit:
+        if not entry.warmup:
+            held.append((position, entry))
+            continue
+        if limit is not None and sent >= limit:
             cut, reason = position, "requests"
             break
-        if (
-            entry.lead_in
-            and entry.session is not None
-            and limit is not None
-            and sent >= limit
-            and last_warm.get(entry.session, -1) > position
-        ):
-            LeadIns.dropped += 1  # the count has run out: the warm-up row this lead-in primes will never be sent
-            continue
         reason = _wait_until(started + min(entry.offset, 0.0) - first, plan, window, started)
         if reason is not None:
             cut = position
             break
-        if not ds.lay_out_replay_row(entry):
-            continue  # a lead-in the rows sent so far already cover
-        if entry.warmup:
-            sent += 1
-            group.spawn(warm_send, ds.replay_request(entry))
-        else:
-            group.spawn(lead_send, ds.replay_request(entry))
+        for _, lead_in in held:
+            send_lead_in(lead_in)
+        held.clear()
+        ds.lay_out_replay_row(entry)
+        sent += 1
+        group.spawn(after, lead_chain.get(entry.session), warm_send, ds.replay_request(entry))
     if cut is None:
+        for _, lead_in in held:  # the lead-ins after the last warm-up row
+            send_lead_in(lead_in)
         _wait_until(started - first, plan, window, started)  # the recorded gap from the last row to time 0
         group.join()
         rate = window.rate(window.latest) if window.latest is not None else None
@@ -5660,23 +5756,23 @@ def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDat
         else:
             reason = "exhausted" if limit is not None and limit > warm_rows else "requests"
     else:
+        # The warm-up rows from the cut on are dropped; the lead-ins held and those after go out unless they sit
+        # ahead of a dropped row of their own session
+        last_dropped = {e.session: n for n, e in enumerate(staged) if e.warmup and n >= cut and e.session is not None}
         ahead: list[ScheduleEntry] = []
-        dropped_sessions: set = set()  # sessions with a dropped warm-up row later on
-        for entry in reversed(staged[cut:]):
-            if entry.warmup:
-                dropped_sessions.add(entry.session)
-            elif entry.session is None or entry.session not in dropped_sessions:
-                ahead.append(entry)
-            else:
+        for position, entry in held + [(n, e) for n, e in enumerate(staged) if n > cut and not e.warmup]:
+            if last_dropped.get(entry.session, -1) > position:
                 LeadIns.dropped += 1
-        ahead.reverse()
+            else:
+                ahead.append(entry)
         groups: dict = {}
         for entry in ds.lay_out_replay_rows(ahead):
             groups.setdefault(entry.session if entry.session is not None else f"#row{entry.index}", []).append(entry)
         lead_started = time.monotonic()
         pool = gevent.pool.Pool(max(1, options.prefix_fill_concurrency))
         for rows in groups.values():
-            pool.spawn(lambda rows=rows: [lead_send(ds.replay_request(e)) for e in rows])
+            prior = lead_chain.get(rows[0].session)
+            pool.spawn(lambda rows=rows, prior=prior: [after(prior, lead_send, ds.replay_request(e)) for e in rows])
         pool.join()
         group.join()
         LeadIns.seconds = time.monotonic() - lead_started
@@ -8974,6 +9070,8 @@ def _(environment, **kw):
         hit = MeasuredReuse.hit_rate()
         entries["measured_hit_rate"] = "" if hit is None else hit
         entries["workload_sha256"] = workload_sha256(environment.parsed_options)
+        entries["workload_options"] = workload_options(environment.parsed_options)
+        entries["workload_options_sha256"] = hashlib.sha256(entries["workload_options"].encode()).hexdigest()
         entries["request_seed"] = resolve_request_seed(environment.parsed_options)
         entries["llm_bench_version"] = LLM_BENCH_VERSION
         if dataset is not None:
