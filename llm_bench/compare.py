@@ -1,7 +1,13 @@
 """Compare two sets of llm_bench summaries (A = without a change, B = with it) from their --summary-file CSVs.
 
     python -m llm_bench.compare --a A1.csv [A2.csv ...] --b B1.csv [B2.csv ...] [--min-noise 0.03] \\
-        [--min-repeats 3] [--json out.json] [--markdown out.md]
+        [--min-repeats 3] [--restarted-between-runs] [--json out.json] [--markdown out.md]
+    python -m llm_bench.compare --recipe A1.csv [A2.csv ...] [--json recipe.json]
+
+--recipe prints, for a baseline's runs, each pair's `--request-seed s_i --warmup-requests N_i` (what every later
+variant run must use to be paired with it) and the workload identity it must match; it refuses a baseline with a
+repeated or missing seed or count or with runs of different workloads. --restarted-between-runs turns the
+same-endpoint warning into a note (below).
 
 The runs are paired: run i uses its own request seed s_i on both sides, A_i warms up to the hit-rate target (and prints
 its N_i), B_i is given --request-seed s_i --warmup-requests N_i, and the runs go A1, B1, A2, B2 ... A repeat with
@@ -260,11 +266,53 @@ def _host(row: dict[str, str]) -> str:
     return re.sub(r"^https?://", "", host).rstrip("/")
 
 
-def warnings_for(a: list[dict[str, str]], b: list[dict[str, str]]) -> list[str]:
-    """Why the comparison may mislead: both sides sent to one host, so B_i's requests (A_i's exact ones, by design)
-    hit the cache A_i filled."""
+SAME_ENDPOINT_NOTE = "same endpoint; the operator states the server was restarted before every run"
+
+
+def warnings_for(
+    a: list[dict[str, str]], b: list[dict[str, str]], restarted: bool = False
+) -> tuple[list[str], list[str]]:
+    """(warnings, notes). Both sides sent to one host: B_i's requests (A_i's exact ones, by design) hit the cache A_i
+    filled, a warning, unless the operator states (--restarted-between-runs) the server was restarted before every
+    run, which makes it a note."""
     shared = sorted(({_host(r) for r in a} & {_host(r) for r in b}) - {""})
-    return [f"{SAME_ENDPOINT_WARNING} ({', '.join(shared)})"] if shared else []
+    if not shared:
+        return [], []
+    where = f" ({', '.join(shared)})"
+    return ([], [SAME_ENDPOINT_NOTE + where]) if restarted else ([SAME_ENDPOINT_WARNING + where], [])
+
+
+def recipe(rows: list[dict[str, str]]) -> dict[str, Any]:
+    """What a later variant run must use to be paired with these baseline runs: per pair its `--request-seed s_i
+    --warmup-requests N_i`, and the workload identity it must match. Raises ValueError when the rows are not a valid
+    baseline (a seed or warm-up count missing, a repeated seed, runs of different workloads)."""
+    problems = []
+    for i, row in enumerate(rows, 1):
+        for column, label in PAIR_IDENTITY:
+            if not row.get(column, ""):
+                problems.append(f"run {i}: {label} is missing from its summary")
+    problems += identity_differences(rows, rows)
+    if problems:
+        raise ValueError("not a valid baseline:\n  - " + "\n  - ".join(dict.fromkeys(problems)))
+    pairs = [
+        {
+            "pair": i,
+            "request_seed": row["Request Seed"],
+            "warmup_requests": row["Warmup Requests"],
+            "flags": f"--request-seed {row['Request Seed']} --warmup-requests {row['Warmup Requests']}",
+        }
+        for i, row in enumerate(rows, 1)
+    ]
+    return {"pairs": pairs, "identity": {column: rows[0].get(column, "") for column, _ in SHARED_IDENTITY}}
+
+
+def recipe_text(result: dict[str, Any]) -> str:
+    identity = result["identity"]
+    lines = [f"pair {p['pair']}: {p['flags']}" for p in result["pairs"]]
+    lines.append(
+        "must match: " + ", ".join(f"{label} {identity[column] or '(none)'}" for column, label in SHARED_IDENTITY)
+    )
+    return "\n".join(lines)
 
 
 def _flag_lines(flagged: list[dict[str, Any]]) -> list[str]:
@@ -277,13 +325,18 @@ def markdown(
     b_runs: int,
     flagged: Optional[list] = None,
     warnings: Optional[list] = None,
+    notes: Optional[list] = None,
 ) -> str:
-    lines = [f"!!! WARNING: {w}" for w in warnings or []] + [
-        f"A: {a_runs} run(s), B: {b_runs} run(s), paired in order",
-        "",
-        "| metric | A | B | mean delta | noise floor (from) | pairs | per-pair deltas | verdict |",
-        "|---|---|---|---|---|---|---|---|",
-    ]
+    lines = (
+        [f"!!! WARNING: {w}" for w in warnings or []]
+        + [f"NOTE: {n}" for n in notes or []]
+        + [
+            f"A: {a_runs} run(s), B: {b_runs} run(s), paired in order",
+            "",
+            "| metric | A | B | mean delta | noise floor (from) | pairs | per-pair deltas | verdict |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+    )
     for r in results:
         noise = f"{r['noise']:.4f}" if r["delta_kind"] == "abs" else f"{100 * r['noise']:.1f}%"
         per_pair = ", ".join(_format_delta(r, d) for d in r["pair_deltas"])
@@ -296,8 +349,22 @@ def markdown(
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--a", nargs="+", required=True, metavar="SUMMARY", help="A's summary CSV(s).")
-    parser.add_argument("--b", nargs="+", required=True, metavar="SUMMARY", help="B's summary CSV(s).")
+    parser.add_argument("--a", nargs="+", metavar="SUMMARY", help="A's summary CSV(s).")
+    parser.add_argument("--b", nargs="+", metavar="SUMMARY", help="B's summary CSV(s).")
+    parser.add_argument(
+        "--recipe",
+        nargs="+",
+        metavar="SUMMARY",
+        help="Instead of comparing: from a baseline's summary CSV(s), print for each pair the flags a later variant "
+        "run must use (--request-seed s_i --warmup-requests N_i) and the workload identity it must match; refuses a "
+        "file that is not a valid baseline. With --json, machine-readable.",
+    )
+    parser.add_argument(
+        "--restarted-between-runs",
+        action="store_true",
+        help="You state the server was restarted before every run: A and B sharing a host is then a note, not a "
+        "warning.",
+    )
     parser.add_argument("--min-noise", type=float, default=0.03, help="Least noise floor (default 0.03).")
     parser.add_argument(
         "--min-repeats",
@@ -308,8 +375,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--json", default=None, help="Write the comparison here as JSON.")
     parser.add_argument("--markdown", default=None, help="Write the comparison here as a markdown table.")
     args = parser.parse_args(argv)
+    if args.recipe is None and not (args.a and args.b):
+        parser.error("give --a and --b to compare, or --recipe for a baseline's flags")
+    if args.recipe is not None and (args.a or args.b):
+        parser.error("--recipe goes alone")
     try:
         ignored: list[str] = []
+        if args.recipe is not None:
+            rows = read_rows(args.recipe, ignored)
+            for note in ignored:
+                print(f"compare: ignoring {note} (not a measured run)", file=sys.stderr)
+            try:
+                result = recipe(rows)
+            except ValueError as e:
+                print(f"compare: {e}", file=sys.stderr)
+                return 2
+            if args.json:
+                with open(args.json, "w") as f:
+                    json.dump(result, f, indent=2)
+            print(recipe_text(result))
+            return 0
         a, b = read_rows(args.a, ignored), read_rows(args.b, ignored)
         for note in ignored:
             print(f"compare: ignoring {note} (not a measured run)", file=sys.stderr)
@@ -321,9 +406,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         results = compare(a, b, args.min_noise, args.min_repeats)
         flagged = flagged_runs("A", a) + flagged_runs("B", b)
-        warnings = warnings_for(a, b)
+        warnings, notes = warnings_for(a, b, args.restarted_between_runs)
         for warning in warnings:
             print(f"compare: !!! WARNING: {warning}", file=sys.stderr)
+        for note in notes:
+            print(f"compare: NOTE: {note}", file=sys.stderr)
         if args.json:
             with open(args.json, "w") as f:
                 json.dump(
@@ -333,12 +420,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "metrics": results,
                         "flagged_runs": flagged,
                         "warnings": warnings,
+                        "notes": notes,
                         "ignored": ignored,
                     },
                     f,
                     indent=2,
                 )
-        table = markdown(results, len(a), len(b), flagged, warnings)
+        table = markdown(results, len(a), len(b), flagged, warnings, notes)
         if args.markdown:
             with open(args.markdown, "w") as f:
                 f.write(table)

@@ -1389,3 +1389,84 @@ def test_g10_the_probe_prints_the_flags_and_exits_0_when_it_measured_something(t
     options.prefix_reuse_probe = False  # any other run with no scored request is still a failure
     monkeypatch.setattr(probe, "failed", 0)
     assert _fire_quitting(options, tmp_path, scored=False) == 1
+
+
+# --- iterating on changes ------------------------------------------------------------------------------------------
+
+
+def test_h1_recipe_prints_each_pairs_flags_and_the_identity_to_match(tmp_path, capsys) -> None:
+    a, _ = _pairs(tmp_path)  # a baseline: seeds 100..102, warm-up counts 50..52
+    out = tmp_path / "recipe.json"
+    assert compare.main(["--recipe", *a, "--json", str(out)]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    assert printed[:3] == [
+        "pair 1: --request-seed 100 --warmup-requests 50",
+        "pair 2: --request-seed 101 --warmup-requests 51",
+        "pair 3: --request-seed 102 --warmup-requests 52",
+    ]
+    assert printed[3] == (
+        "must match: workload file sha256 abc, workload options opts, rate (target QPS) 40.0, llm_bench version 1"
+    )
+    result = json.loads(out.read_text())
+    assert [p["flags"] for p in result["pairs"]] == [
+        "--request-seed 100 --warmup-requests 50",
+        "--request-seed 101 --warmup-requests 51",
+        "--request-seed 102 --warmup-requests 52",
+    ]
+    assert result["identity"] == {
+        "Workload Sha256": "abc",
+        "Workload Options Sha256": "opts",
+        "Target Qps": "40.0",
+        "Llm Bench Version": "1",
+    }
+    # the rows of one file are the pairs too
+    one_file = _summary(
+        tmp_path / "all.csv",
+        [{"Request Seed": str(i), "Warmup Requests": str(7 + i)} for i in range(2)],
+    )
+    assert compare.main(["--recipe", one_file]) == 0
+    assert "pair 2: --request-seed 1 --warmup-requests 8" in capsys.readouterr().out
+
+
+def test_h1_recipe_refuses_a_file_that_is_not_a_valid_baseline(tmp_path, capsys) -> None:
+    same_seed, _ = _pairs(tmp_path, a_extra=lambda i: {"Request Seed": "5"})
+    assert compare.main(["--recipe", *same_seed]) == 2
+    assert "not a valid baseline" in capsys.readouterr().err
+    missing, _ = _pairs(tmp_path, a_extra=lambda i: {"Request Seed": ""} if i == 1 else {})
+    assert compare.main(["--recipe", *missing]) == 2
+    assert "run 2: request seed is missing" in capsys.readouterr().err
+    no_count, _ = _pairs(tmp_path, a_extra=lambda i: {"Warmup Requests": ""} if i == 0 else {})
+    assert compare.main(["--recipe", *no_count]) == 2
+    assert "run 1: warm-up requests is missing" in capsys.readouterr().err
+    mixed, _ = _pairs(tmp_path, a_extra=lambda i: {"Workload Sha256": "other"} if i == 2 else {})
+    assert compare.main(["--recipe", *mixed]) == 2
+    assert "workload file sha256 differs between runs" in capsys.readouterr().err
+    out = tmp_path / "recipe.json"
+    assert compare.main(["--recipe", *mixed, "--json", str(out)]) == 2 and not out.exists()  # nothing half-written
+
+
+def test_h1_recipe_and_compare_are_separate_modes(tmp_path) -> None:
+    a, b = _pairs(tmp_path)
+    for argv in (["--recipe", *a, "--a", *a, "--b", *b], ["--a", *a], []):
+        with pytest.raises(SystemExit):
+            compare.main(argv)
+
+
+def test_h2_restarted_between_runs_turns_the_same_endpoint_warning_into_a_note(tmp_path, capsys) -> None:
+    host = {"Target Host": "http://server-a:8000"}
+    a, b = _pairs(tmp_path, a_extra=lambda i: host, b_extra=lambda i: host)
+    out, md = tmp_path / "out.json", tmp_path / "out.md"
+    assert compare.main(["--a", *a, "--b", *b, "--json", str(out), "--markdown", str(md)]) == 0
+    assert SAME_ENDPOINT in capsys.readouterr().err  # without the flag the warning stays
+    assert (
+        compare.main(["--a", *a, "--b", *b, "--restarted-between-runs", "--json", str(out), "--markdown", str(md)]) == 0
+    )
+    captured = capsys.readouterr()
+    note = "same endpoint; the operator states the server was restarted before every run"
+    assert note in captured.err and note in captured.out and note in md.read_text()
+    assert note in json.loads(out.read_text())["notes"][0] and json.loads(out.read_text())["warnings"] == []
+    assert "WARNING" not in captured.err + captured.out + md.read_text()
+    # on two servers the flag changes nothing
+    a, b = _pairs(tmp_path, a_extra=lambda i: host, b_extra=lambda i: {"Target Host": "http://server-b:8000"})
+    assert compare.main(["--a", *a, "--b", *b, "--restarted-between-runs", "--json", str(out)]) == 0
+    assert json.loads(out.read_text())["notes"] == [] and json.loads(out.read_text())["warnings"] == []
