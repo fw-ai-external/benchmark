@@ -1451,7 +1451,6 @@ def test_sampled_prompts_stay_in_their_band_and_the_context(caplog) -> None:
         assert st.mean(prompts) == pytest.approx(spec["classes"][ci]["prompt_tokens"], rel=0.03)
     assert max(r.prompt_tokens + r.generated_tokens for r in requests) <= 32768
     # a long output drawn for a long prompt is rare (expected well under one per 60k here, so not asserted present);
-    # the cut itself is exercised with a tight context in test_tier_output_keeps_the_sampled_spread_and_the_context_cap
     assert ds.context_cut_requests < len(requests) / 1000
     # a cap never moves a given quantile below its value
     dist = LengthQuantiles(((0.5, 400.0), (0.99, 1600.0)), cap=1000)
@@ -3819,15 +3818,6 @@ def test_a_first_row_reuses_its_lead_in_recorded_exactly_cached_long(tmp_path) -
     assert ds.replay_request(first).prompt.startswith(ds.replay_request(lead).prompt)
 
 
-# sha256 of prefix_tier_split's source: the same function as task 15's eviction simulation (fw-ai/fireworks #68788
-# @ c612d16dd7b, serving/perfagent_mcp/scripts/pool_sizing_study.py), byte for byte, so the two agree
-_PREFIX_TIER_SPLIT_SHA = "67ce1c79d4634f02e03cdedb6642c10828136000a2eda90885f473fe2ee95fad"
-
-
-def _zipf(n, s):
-    return [1 / (j + 1) ** s for j in range(n)]
-
-
 def test_served_config_identity_hashes_the_config_it_read(tmp_path) -> None:
     """The summary carries the sha256 of the served model's config.json bytes and its reuse fields (text_config
     first), so a runner can match them against the replica's launch config."""
@@ -4015,3 +4005,44 @@ def test_replay_reuse_records_carry_the_schedule_row(tmp_path) -> None:
     m = re.search(_TASK15_REUSE_RE, line)
     assert m.group(6) == "900" and m.group(7) == "7"  # task 15's parser reads it
     assert re.search(_TASK15_REUSE_RE, line.replace(" row=7", "")).group(7) is None  # absent on draws
+
+
+def test_per_class_reasoning_effort_reaches_the_payload() -> None:
+    """D-152: a class's reasoning-effort tier is sent per request (the row's own tier still wins in replay),
+    and it never changes llm_bench's text pool or its local cache file: the same cache key and prefix text for low
+    and high. (The server's KV cache is a different matter: the tier's preamble sits ahead of the shared prefix,
+    so the server caches a prefix once per tier it's requested with.)"""
+    mix = json.loads(json.dumps(MIX))
+    mix["classes"][0]["reasoning_effort"] = "high"
+    mix["classes"][1]["reasoning_effort"] = "low"
+    tokenizer = WordTokenizer()
+    ds = _dataset(mix, tokenizer=tokenizer)
+    ds.build_prefixes()
+    same_mix = json.loads(json.dumps(mix))
+    same_mix["classes"][1]["reasoning_effort"] = "high"  # only the tier changes, same class at index 1
+    low = _dataset(same_mix, tokenizer=tokenizer)
+    # pool identity across tiers: same key slot and same prefix text
+    assert ds._prefix_cache_slot(1)[:2] == low._prefix_cache_slot(1)[:2]  # the tier is not in the cache key
+    ds.build_prefixes()
+    low.build_prefixes()
+    assert ds.prefix(1, 0) == low.prefix(1, 0)  # nor in the prefix text
+    # the tier reaches the payload, per class, with a row's own tier winning in replay
+    from types import SimpleNamespace
+
+    from load_test import build_shape_mix_request, OpenAIProvider
+
+    provider = OpenAIProvider(MODEL, _options(chat=True))
+    drawn = {r.class_name: r for r in _take(ds, 60)}
+    for name, tier in (("chat", "high"), ("agent", "low")):
+        data, _ = build_shape_mix_request(provider, drawn[name])
+        assert data["reasoning_effort"] == tier, name
+    assert "reasoning_effort" not in build_shape_mix_request(provider, drawn["cold"])[0]
+    # replay: the row's tier wins; the class's tier is the fallback
+    from load_test import ScheduleEntry
+
+    cls_effort = ds.mix.classes[0].reasoning_effort
+    row_tier = ds.replay_request(ScheduleEntry(0.0, 0, session="x", reasoning_effort="low"))
+    assert build_shape_mix_request(provider, row_tier)[0]["reasoning_effort"] == "low"
+    row_none = ds.replay_request(ScheduleEntry(0.0, 0, session="x"))
+    assert build_shape_mix_request(provider, row_none)[0]["reasoning_effort"] == cls_effort
+    del SimpleNamespace

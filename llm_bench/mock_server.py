@@ -162,15 +162,7 @@ class PrefixCacheEngine:
 _HEAD_TOKEN_BASE = 9_990_000
 
 
-def make_handler(
-    engine: PrefixCacheEngine,
-    ttft: float,
-    tpot: float,
-    log=None,
-    slow_fraction=0.0,
-    slow_ttft=0.0,
-    num_draft_tokens: int = 0,
-):
+def make_handler(engine: PrefixCacheEngine, ttft: float, tpot: float, log=None, slow_fraction=0.0, slow_ttft=0.0):
     log_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -182,19 +174,6 @@ def make_handler(
         def do_POST(self):
             arrived = time.time()
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            # The engine refuses an acceptance override whose length differs from its draft count (a UserError),
-            # so a schedule padded wider than the replica's num_draft_tokens fails every row: caught here
-            override = body.get("acceptance_probs_override")
-            if num_draft_tokens and isinstance(override, list) and len(override) != num_draft_tokens:
-                raw = json.dumps(
-                    {"error": {"message": f"acceptance_probs_override must have {num_draft_tokens} entries"}}
-                ).encode()
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-                return
             ids = engine.token_ids(body)
             cached = engine.serve(ids, self.headers.get("x-session-affinity"))
             if log:
@@ -258,13 +237,6 @@ def main(argv=None):
     parser.add_argument("--ttft", type=float, default=0.05, help="Seconds before the first streamed token.")
     parser.add_argument("--tpot", type=float, default=0.002, help="Seconds between streamed tokens.")
     parser.add_argument(
-        "--num-draft-tokens",
-        type=int,
-        default=0,
-        help="The replica's speculative draft count: an acceptance_probs_override of any other length is refused "
-        "(400), as the engine refuses it (a UserError). 0 doesn't check.",
-    )
-    parser.add_argument(
         "--chat-head",
         type=int,
         default=0,
@@ -290,7 +262,7 @@ def main(argv=None):
     ThreadingHTTPServer.daemon_threads = True
     server = ThreadingHTTPServer(
         (args.host, args.port),
-        make_handler(engine, args.ttft, args.tpot, log, args.slow_fraction, args.slow_ttft, args.num_draft_tokens),
+        make_handler(engine, args.ttft, args.tpot, log, args.slow_fraction, args.slow_ttft),
     )
     print(
         f"mock_server: http://{args.host}:{args.port}  window {args.window}  boundary {args.boundary}  "

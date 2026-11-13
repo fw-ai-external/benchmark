@@ -2877,6 +2877,9 @@ def build_shape_mix_request(provider, request: ShapeRequest, output_mode: str = 
     data = provider.format_payload(request.prompt, request.generated_tokens, None)
     if request.messages is not None:
         data["messages"] = request.messages
+    if request.reasoning_effort is not None:
+        # a class's reasoning-effort tier (before overrides, so a replay row's own tier wins)
+        data["reasoning_effort"] = request.reasoning_effort
     if request.overrides:
         data.update(request.overrides)
     if output_mode == "max":
@@ -5868,8 +5871,6 @@ class LLMUser(HttpUser):
             self.prompt_tokenizer_tokens = None
         self.ramping_pacer = None  # Will be set if --ramping-time is used
         self.qps_pacer = None  # Will be set if --qps is used
-        # Tokenizes streamed deltas for the reservation cancel count (logprob_tokens is preferred when asked)
-        self.stream_tokenizer = InitTracker.load_tokenizer(self.environment.parsed_options.tokenizer)
         # The -pcml shared prefix this run's requests all start with (None until the dataset is built)
         self._designed_cached_tokens = None
         # The run's one calibrated chat head on -pcml rows (0 in completions or unmeasured): prompt= adds it back
@@ -7346,7 +7347,7 @@ def init_parser(parser):
     )
     parser.add_argument(
         "--shape-mix-output-mode",
-        choices=["exact", "max", "reservation"],
+        choices=["exact", "max"],
         default="exact",
         help="For --shape-mix: 'exact' (default) forces each class's generated_tokens (max_tokens = min_tokens, "
         "ignore_eos). 'max' only sets max_tokens = generated_tokens, with no min_tokens or ignore_eos, so the model "
