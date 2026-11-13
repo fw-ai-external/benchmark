@@ -1470,3 +1470,34 @@ def test_h2_restarted_between_runs_turns_the_same_endpoint_warning_into_a_note(t
     a, b = _pairs(tmp_path, a_extra=lambda i: host, b_extra=lambda i: {"Target Host": "http://server-b:8000"})
     assert compare.main(["--a", *a, "--b", *b, "--restarted-between-runs", "--json", str(out)]) == 0
     assert json.loads(out.read_text())["notes"] == [] and json.loads(out.read_text())["warnings"] == []
+
+
+# --- the replay warm-up's reported hit rate -----------------------------------------------------------------------
+
+
+def test_g11_the_reported_hit_rate_is_the_one_the_stop_used(monkeypatch, tmp_path) -> None:
+    """The warm-up stopped on a target with requests still in flight; when they completed (cold, large) the window
+    after them read 0.897 against a 0.9745 target while the reason said target. The stop's own window is reported
+    (and the end figure beside it)."""
+    cached = {0: 700, 1: 0}  # row 0 is a hit and completes in time; row 1 is cold and slow, still in flight at the stop
+    delay = {0: 0.25, 1: 0.6}
+
+    def fake(self, request, one_token=False):
+        time.sleep(delay.get(request.schedule_row, 0.0))
+        return (700, cached.get(request.schedule_row, 0))
+
+    monkeypatch.setattr(UnscoredSender, "post", fake)
+    plan = WarmupPlan("target", hit_rate=0.95, tolerance=0.02, window_s=0.3, cap_s=None)
+    _replay_run(tmp_path, "http://127.0.0.1:9", plan)
+    assert Warmup.reason == "target" and Warmup.requests == 2
+    assert Warmup.hit_rate == pytest.approx(1.0) and Warmup.hit_rate >= Warmup.target - 0.02  # what the stop saw
+    assert Warmup.hit_rate_end == pytest.approx(0.0)  # the window once the cold request was in
+    assert Warmup.summary_entries()["warmup_hit_rate_end"] == pytest.approx(0.0)
+
+
+def test_g11_a_warmup_that_ran_out_of_rows_is_exhausted_and_reports_the_end_rate(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(UnscoredSender, "post", lambda self, request, one_token=False: (700, 100))  # ~14% hits
+    plan = WarmupPlan("target", hit_rate=0.95, tolerance=0.02, window_s=0.3, cap_s=None)
+    _replay_run(tmp_path, "http://127.0.0.1:9", plan)
+    assert Warmup.reason == "exhausted" and Warmup.requests == 5
+    assert Warmup.hit_rate == pytest.approx(100 / 700) == pytest.approx(Warmup.hit_rate_end)

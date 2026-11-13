@@ -5593,6 +5593,8 @@ class HitRateWindow:
         self._cached = [0]
         self.latest: Optional[float] = None
         self.unreported = 0
+        # What the stop decision saw: (hit rate over its window, or None without data), set when it stopped the warm-up
+        self.stop: Optional[tuple] = None
 
     def add(self, at: float, prompt_tokens: int, cached_tokens: Optional[int]) -> None:
         if cached_tokens is None:
@@ -5618,7 +5620,8 @@ class Warmup:
     requests = 0  # warm-up requests sent: the count --warmup-requests takes
     prompt_tokens = 0  # prompt tokens the server reports for them
     duration_s = 0.0
-    hit_rate: Optional[float] = None  # over the last window
+    hit_rate: Optional[float] = None  # over the window the stop decision used (the last one, when nothing decided)
+    hit_rate_end: Optional[float] = None  # over the last window once the requests in flight had completed
     target: Optional[float] = None
     failed = 0
     unreported = 0
@@ -5633,6 +5636,7 @@ class Warmup:
             "warmup_prompt_tokens": cls.prompt_tokens if active else "",
             "warmup_duration_s": cls.duration_s if active else "",
             "warmup_hit_rate": "" if cls.hit_rate is None else cls.hit_rate,
+            "warmup_hit_rate_end": "" if cls.hit_rate_end is None else cls.hit_rate_end,
             "warmup_target_hit_rate": "" if cls.target is None else cls.target,
             "warmup_failed_requests": cls.failed if active else "",
         }
@@ -5717,8 +5721,10 @@ def _warmup_stop_reason(plan: WarmupPlan, window: HitRateWindow, started: float)
     if plan.mode == "target" and now - started >= plan.window_s:
         rate = window.rate(now)
         if rate is not None and rate >= plan.hit_rate - plan.tolerance:
+            window.stop = (rate,)
             return "target"
     if plan.cap_s is not None and now - started >= plan.cap_s:
+        window.stop = (window.rate(now),)
         return "cap"
     return None
 
@@ -5737,13 +5743,18 @@ def _finish_warmup(plan: WarmupPlan, reason: str, sent: int, started: float, win
     """Record the warm-up for the summary, and print the flag that gives B this warm-up."""
     Warmup.mode, Warmup.reason, Warmup.requests = plan.mode, "" if plan.mode == "none" else reason, sent
     Warmup.duration_s = time.monotonic() - started
-    Warmup.hit_rate = window.rate(window.latest) if window.latest is not None else None
+    # The rate over the window after every response is in: what the warm-up ended with
+    Warmup.hit_rate_end = window.rate(window.latest) if window.latest is not None else None
+    # The figure the stop used (its window ended when it decided, before the requests still in flight completed),
+    # so the reason and the reported rate agree; a warm-up not stopped by a decision reports the end rate
+    Warmup.hit_rate = window.stop[0] if window.stop is not None else Warmup.hit_rate_end
     Warmup.target = plan.hit_rate if plan.mode == "target" else None
     Warmup.failed, Warmup.unreported = sender.failed, window.unreported
     rate = "n/a" if Warmup.hit_rate is None else f"{Warmup.hit_rate:.3f}"
     logger.info(
         f"Warm-up done ({plan.mode}, reason {reason}): {sent} requests, {Warmup.prompt_tokens} prompt tokens in "
-        f"{Warmup.duration_s:.1f}s, last-window hit rate {rate}"
+        f"{Warmup.duration_s:.1f}s, hit rate {rate}"
+        + ("" if Warmup.hit_rate_end is None else f" (at the end {Warmup.hit_rate_end:.3f})")
         + (f" (target {plan.hit_rate:g} - {plan.tolerance:g})" if plan.mode == "target" else "")
         + (f"; first errors: {sender.errors}" if sender.errors else "")
     )
@@ -5902,6 +5913,7 @@ def run_replay_warmup(environment, options: argparse.Namespace, ds: "ShapeMixDat
             send_lead_in(lead_in)
         _wait_until(started - first, plan, window, started)  # the recorded gap from the last row to time 0
         group.join()
+        window.stop = None  # no decision cut this warm-up (the tail wait doesn't stop it): the end rate decides
         rate = window.rate(window.latest) if window.latest is not None else None
         if plan.mode == "target":
             reason = "target" if rate is not None and rate >= plan.hit_rate - plan.tolerance else "exhausted"
