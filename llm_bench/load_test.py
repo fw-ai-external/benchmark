@@ -1509,6 +1509,7 @@ class ShapeMixDataset:
         context_tokens: Optional[int] = None,
         split_restore_classes: bool = True,
         server_chat_head: int = 0,
+        replay_acceptance_per_row: bool = False,
     ):
         self.mix = mix
         self.server_chat_head = server_chat_head or 0
@@ -1618,6 +1619,7 @@ class ShapeMixDataset:
             self._popularity_cumulative(ci, default_popularity_zipf) for ci in range(len(self.classes))
         ]
         self._strata: dict = {}
+        self.replay_acceptance_per_row = replay_acceptance_per_row
         self._filler_offsets = [array("I", bytes(4 * len(t))) for t in self._filler_tokens]
         self._filler_widths = [array("I", [_UNBUILT]) * len(t) for t in self._filler_tokens]
         if self.tail_variants:
@@ -2694,7 +2696,12 @@ class ShapeMixDataset:
     def replay_request(self, entry: "ScheduleEntry") -> ShapeRequest:
         """The request for a --replay-schedule row (see prepare_replay), tagged with the row's position in the
         schedule file, so a checker can join each logged reuse record to its recorded row."""
-        return dataclasses.replace(self._replay_request(entry), schedule_row=entry.row)
+        request = dataclasses.replace(self._replay_request(entry), schedule_row=entry.row)
+        if self.replay_acceptance_per_row and entry.matched_per_pos is not None:
+            request = dataclasses.replace(
+                request, overrides={**(request.overrides or {}), **_row_acceptance_override(entry)}
+            )
+        return request
 
     def _replay_request(self, entry: "ScheduleEntry") -> ShapeRequest:
         plan = getattr(self, "_replay", {}).get(entry.index)
@@ -2947,6 +2954,7 @@ class DatasetHolder:
                     server_chat_head=server_chat_head,
                     # Replay rows carry their own cached lengths: its class pools stay at the floor
                     split_restore_classes=not getattr(options, "replay_schedule", None),
+                    replay_acceptance_per_row=getattr(options, "replay_acceptance_per_row", False),
                 )
                 ds = cls._shape_mix_instance
                 ds.served_model_config = resolve_served_model_config(options)
@@ -3651,6 +3659,10 @@ class ScheduleEntry:
     session: Optional[str] = None
     index: int = 0  # position in the whole time-sorted schedule
     row: int = 0  # 0-based position among the schedule file's rows, in file order (what a checker joins on)
+    # Per-row speculative decoding: tokens matched / drafted per draft position (raw counts), when the schedule
+    # carries them; None on lead-ins and rows that drafted nothing
+    matched_per_pos: Optional[list] = None
+    drafted_per_pos: Optional[list] = None
     cached_length: Optional[int] = None  # recorded reusable (cached) prompt tokens, as the server counts them
     cancelled: bool = False
     temperature: Optional[float] = None
@@ -3674,7 +3686,7 @@ _REPLAY_ALIASES = {
 # Every field a schedule row may carry; others are reported (not silently dropped)
 _REPLAY_FIELDS = frozenset(
     {"timestamp", "time_s", "class", "session_id", "pod", "prefix_index", "cancelled", "lead_in"}
-    | {"temperature", "top_p", "reasoning_effort"}
+    | {"temperature", "top_p", "reasoning_effort", "matched_per_pos", "drafted_per_pos"}
     | {name for names in _REPLAY_ALIASES.values() for name in names}
 )
 
@@ -3736,6 +3748,25 @@ def pcml_reuse_record(designed_cached: int, delivered, client_prompt, chat_head:
     return reuse_record(
         "default", designed_cached, delivered, prompt=client_prompt + chat_head if client_prompt else client_prompt
     )
+
+
+def _row_acceptance_override(entry: "ScheduleEntry") -> dict:
+    """The row's acceptance_probs_override from its raw per-position counts: matched/drafted where the position was
+    drafted, and 0.0 where it wasn't (padded lists), so the engine stops speculating exactly where the recording
+    did. Rows that drafted nothing carry no override (the engine drafts nothing to accept)."""
+    rates = [(m / d) if d else 0.0 for m, d in zip(entry.matched_per_pos or (), entry.drafted_per_pos or ())]
+    return {"acceptance_probs_override": rates}
+
+
+def _replay_acceptance(row: dict, key: str, where: str) -> Optional[list]:
+    """A per-row speculative-decoding count list (matched_per_pos / drafted_per_pos), or None when absent. Lists
+    are padded to the read's widest row: a drafted=0 position means "not drafted", not "never matched"."""
+    value = row.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(x, int) and x >= 0 for x in value):
+        raise ValueError(f"{where}: '{key}' must be a list of non-negative integers")
+    return value
 
 
 def _replay_effort(row: dict, where: str) -> Optional[str]:
@@ -3855,6 +3886,7 @@ def load_replay_schedule(
     seed=None,
     pod_select: Optional[str] = None,
     retime_min_parent_gap: bool = False,
+    acceptance_per_row: bool = False,
 ) -> tuple:
     """--replay-schedule JSONL: one request per line, {"timestamp": <ms>, "class": "<name>"} (AIPerf's
     millisecond timestamps; "time_s" in seconds also works), optionally "prefix_index" (a prefix of the class
@@ -3919,9 +3951,24 @@ def load_replay_schedule(
                 "temperature": lenient("temperature", lambda: _replay_float(row, "temperature", where, 0.0, None)),
                 "top_p": lenient("top_p", lambda: _replay_float(row, "top_p", where, 0.0, 1.0)),
                 "reasoning_effort": lenient("reasoning_effort", lambda: _replay_effort(row, where)),
+                "matched_per_pos": lenient(
+                    "matched_per_pos", lambda: _replay_acceptance(row, "matched_per_pos", where)
+                ),
+                "drafted_per_pos": lenient(
+                    "drafted_per_pos", lambda: _replay_acceptance(row, "drafted_per_pos", where)
+                ),
                 "pod": None if pod is None else str(pod),
                 "lead_in": _replay_bool(row, "lead_in", where),
             }
+            # The pair is validated together: a length mismatch or matched > drafted is a schedule error, not a
+            # per-row default (the server rejects a rate above 1, and a mismatch truncated silently)
+            if fields["matched_per_pos"] is not None or fields["drafted_per_pos"] is not None:
+                if (fields["matched_per_pos"] is None) != (fields["drafted_per_pos"] is None):
+                    raise ValueError(f"{where}: 'matched_per_pos' and 'drafted_per_pos' come together")
+                if len(fields["matched_per_pos"]) != len(fields["drafted_per_pos"]):
+                    raise ValueError(f"{where}: 'matched_per_pos' and 'drafted_per_pos' must be the same length")
+                if any(m > d for m, d in zip(fields["matched_per_pos"], fields["drafted_per_pos"])):
+                    raise ValueError(f"{where}: 'matched_per_pos' exceeds 'drafted_per_pos' at some position")
             fields["defaulted"] = tuple(defaulted)
             if (
                 fields["cached_length"] is not None
@@ -3960,6 +4007,22 @@ def load_replay_schedule(
         ScheduleEntry(t - start, ci, session=session, index=i, **fields)
         for i, (t, _, ci, session, fields) in enumerate(raw)
     )
+    # The per-row acceptance flag and the columns must agree, both ways: a schedule whose acceptance columns
+    # would be silently ignored is forced acceptance (a repeat of the baseline), and a flag without columns is a
+    # mis-specified schedule
+    with_acceptance = sum(1 for e in entries if e.matched_per_pos is not None)
+    scored = sum(1 for e in entries if not e.lead_in)
+    if acceptance_per_row and with_acceptance == 0:
+        raise ValueError(
+            f"--replay-acceptance-per-row: no row of {path} carries matched_per_pos/drafted_per_pos "
+            f"(rebuild the schedule with them, or drop the flag)"
+        )
+    if not acceptance_per_row and with_acceptance:
+        raise ValueError(
+            f"--replay-schedule {path}: {with_acceptance} of {scored} scored rows carry "
+            f"matched_per_pos/drafted_per_pos, which this run would silently ignore (forced acceptance, a repeat "
+            f"of the baseline). Pass --replay-acceptance-per-row, or rebuild the schedule without the columns"
+        )
     retime_spec = parse_replay_retime(retime)
     recorded_pods = sorted({e.pod for e in entries if e.pod is not None}, key=_pod_sort_key)
     if recorded_pods:
@@ -3994,6 +4057,7 @@ def replay_entries(options: argparse.Namespace, class_names: tuple) -> tuple:
         resolve_request_seed(options),
         getattr(options, "replay_pod", None),
         getattr(options, "replay_retime_min_parent_gap", "off") == "recorded",
+        acceptance_per_row=getattr(options, "replay_acceptance_per_row", False),
     )
 
 
@@ -4821,6 +4885,13 @@ def _defer_run_time_to_after_spawn(environment, **_kwargs):
 def validate_shape_mix_options(options: argparse.Namespace) -> None:
     """Parse --shape-mix against the chat template overhead; raises ValueError naming any class too short."""
     resolve_shape_mix_corpus(getattr(options, "shape_mix_corpus", None))
+    if getattr(options, "replay_acceptance_per_row", False):
+        if not getattr(options, "replay_schedule", None):
+            raise ValueError("--replay-acceptance-per-row needs --replay-schedule")
+    if getattr(options, "replay_acceptance_per_row", False) and getattr(options, "acceptance_probs_override", None):
+        raise ValueError(
+            "--replay-acceptance-per-row replaces --acceptance-probs-override per row; drop the global override"
+        )
     if (
         getattr(options, "prefix_reuse_overhang", None) is None
         and resolve_prefix_reuse_overhang(options) == 0
@@ -7276,6 +7347,16 @@ def init_parser(parser):
         help="With --qps or --replay-schedule: seconds between 'Arrivals so far' log lines carrying the delivered gap "
         "CV2 under serving's idle rule (also in the summary as Delivered Gap Cv2 Idle Rule), for a mid-run check. "
         "0 turns it off.",
+    )
+    parser.add_argument(
+        "--replay-acceptance-per-row",
+        action="store_true",
+        default=False,
+        help="With --replay-schedule: send each row's recorded speculative-decoding acceptance, derived from its "
+        "matched_per_pos / drafted_per_pos columns, as that row's acceptance_probs_override (replacing the global "
+        "--acceptance-probs-override). Refuses a schedule whose scored rows lack the columns, and refuses the "
+        "columns without the flag (they would be silently ignored: forced acceptance, a repeat of the baseline). "
+        "Off by default.",
     )
     parser.add_argument(
         "--qps-max-lateness",
