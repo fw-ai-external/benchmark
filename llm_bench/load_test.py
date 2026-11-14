@@ -5714,6 +5714,21 @@ class LLMUser(HttpUser):
                 raise AssertionError("--prompt-images-with-resolutions is only supported with --chat mode.")
             self.prompt_images = [self._create_base64_image(width, height) for width, height in image_resolutions]
 
+        self.image_count_sampler = None
+        count_weights = self.environment.parsed_options.prompt_image_count_weights
+        if count_weights:
+            if len(image_resolutions) != 1:
+                raise AssertionError(
+                    "--prompt-image-count-weights needs exactly one --prompt-images-with-resolutions entry."
+                )
+            width, height = image_resolutions[0]
+            pool_size = self.environment.parsed_options.prompt_image_pool_size
+            self.image_count_sampler = ImageCountSampler(count_weights)
+            self.image_pool = itertools.cycle(
+                [self._create_base64_image(width, height, unique_id=i) for i in range(pool_size)]
+            )
+            self.prompt_images = None
+
         self.max_tokens_sampler = LengthSampler(
             distribution=self.environment.parsed_options.max_tokens_distribution,
             mean=self.environment.parsed_options.max_tokens,
@@ -5921,9 +5936,16 @@ class LLMUser(HttpUser):
             f"{len(ds.question_ids)} questions of ~{max(ds.question_tokens)} tokens"
         )
 
-    def _create_base64_image(self, width, height):
-        """Create a random RGB image with the given dimensions and return as base64 data URI."""
+    def _create_base64_image(self, width, height, unique_id=None):
+        """Create an RGB image with the given dimensions and return as base64 data URI.
+
+        With unique_id, a small patch of pixels derived from it makes each image's pixels and bytes distinct.
+        """
         img = Image.new("RGB", (width, height))
+        if unique_id is not None:
+            rng = random.Random(unique_id)
+            patch = Image.frombytes("RGB", (16, 16), bytes(rng.getrandbits(8) for _ in range(16 * 16 * 3)))
+            img.paste(patch, (0, 0))
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG")
         img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -5932,12 +5954,16 @@ class LLMUser(HttpUser):
     def _get_input(self):
         prompt, prompt_tokens = next(self.dataset)
 
-        if self.prompt_images:
+        if self.image_count_sampler is not None:
+            images = [next(self.image_pool) for _ in range(self.image_count_sampler.sample())] or None
+        elif self.prompt_images:
             images = self.prompt_images
-            prompt_images_positioning = self.environment.parsed_options.prompt_images_positioning
-            prompt = self.insert_image_placeholders(prompt, len(images), prompt_images_positioning)
         else:
             images = None
+
+        if images:
+            prompt_images_positioning = self.environment.parsed_options.prompt_images_positioning
+            prompt = self.insert_image_placeholders(prompt, len(images), prompt_images_positioning)
 
         return prompt, prompt_tokens, images
 
@@ -6733,6 +6759,28 @@ class LLMUser(HttpUser):
             InitTracker.notify_request_complete()
 
 
+class ImageCountSampler:
+    """Samples a per-request image count from "count:weight,..." (e.g. "0:28,6:40,19:32")."""
+
+    def __init__(self, spec: str):
+        self.counts, self.weights = [], []
+        for item in spec.split(","):
+            try:
+                count, weight = item.split(":")
+                count, weight = int(count), float(weight)
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Invalid image count weight {item!r}; expected COUNT:WEIGHT")
+            if count < 0 or weight < 0:
+                raise argparse.ArgumentTypeError(f"Image count and weight must be >= 0: {item!r}")
+            self.counts.append(count)
+            self.weights.append(weight)
+        if sum(self.weights) <= 0:
+            raise argparse.ArgumentTypeError("Image count weights must sum to > 0")
+
+    def sample(self) -> int:
+        return random.choices(self.counts, weights=self.weights)[0]
+
+
 def parse_resolution(res_str):
     """Parse a resolution string like '3084x1080' into a tuple of integers (width, height)."""
     try:
@@ -6962,6 +7010,21 @@ def init_parser(parser):
         "(3084 width x 1080 height and 1024 width x 1024 height) into the prompt. "
         "Images will be spaced out evenly across the prompt."
         "Only supported with --chat mode.",
+    )
+    parser.add_argument(
+        "--prompt-image-count-weights",
+        type=str,
+        default=None,
+        help="Sample each request's image count from COUNT:WEIGHT pairs, e.g. \"0:28,6:40,19:32\". "
+        "Needs exactly one --prompt-images-with-resolutions entry; images cycle through "
+        "--prompt-image-pool-size distinct images, so repeated bytes recur only after the pool wraps. "
+        "Only supported with --chat mode.",
+    )
+    parser.add_argument(
+        "--prompt-image-pool-size",
+        type=int,
+        default=4096,
+        help="Number of distinct images for --prompt-image-count-weights. Default 4096.",
     )
     parser.add_argument(
         "--prompt-images-positioning",
