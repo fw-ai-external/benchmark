@@ -1982,3 +1982,173 @@ def test_t8_the_dead_code_is_gone() -> None:
     assert "rows" not in block
     with pytest.raises(ValueError, match="'rows' must be a non-negative integer"):
         load_test.parse_warmup_block({"rows": -1}, "meta", True)
+
+
+# --- declared differences ------------------------------------------------------------------------------------------
+
+BASE_OPTIONS = {"qps_distribution": "gamma", "shape_mix_sample_lengths": False, "run_time_s": 60, "request_seed": 1}
+
+
+def _options_json(**changes) -> str:
+    return json.dumps({**BASE_OPTIONS, **changes})
+
+
+def _declared_pairs(tmp_path, b_options=None, a_options=None, b_extra=None, a_extra=None, n=3):
+    """n pairs; A's options are BASE_OPTIONS (+ a_options), B's differ by b_options (their hash differs when they do)."""
+    return _pairs(
+        tmp_path,
+        n=n,
+        a_extra=lambda i: {"Workload Options": _options_json(**(a_options or {})), **(a_extra(i) if a_extra else {})},
+        b_extra=lambda i: {
+            "Workload Options": _options_json(**(b_options or {})),
+            "Workload Options Sha256": "other" if b_options else "opts",
+            **(b_extra(i) if b_extra else {}),
+        },
+    )
+
+
+def test_u1_a_declared_option_may_differ_and_the_output_says_what_was_compared(tmp_path, capsys) -> None:
+    a, b = _declared_pairs(tmp_path, b_options={"shape_mix_sample_lengths": True})
+    assert compare.main(["--a", *a, "--b", *b]) == 2  # undeclared: refused (the options hash differs)
+    capsys.readouterr()
+    out, md = tmp_path / "out.json", tmp_path / "out.md"
+    argv = ["--a", *a, "--b", *b, "--expected-difference", "shape_mix_sample_lengths", "--json", str(out)]
+    assert compare.main(argv + ["--markdown", str(md)]) == 0
+    captured = capsys.readouterr()
+    header = "Comparing A vs B under declared differences: shape_mix_sample_lengths (A: false, B: true)"
+    assert header in captured.out and header in md.read_text() and header in captured.err
+    result = json.loads(out.read_text())
+    assert result["declared_differences"] == [{"name": "shape_mix_sample_lengths", "a": "false", "b": "true"}]
+    # B's warm-up has A's count but not A's requests: said in every output
+    note = "B's warm-up requests themselves differ from A's under the declared difference: the same count, but different traffic"
+    assert note in captured.out and note in captured.err and note in md.read_text() and note in result["notes"]
+
+
+def test_u1_an_undeclared_difference_still_refuses_and_names_it(tmp_path, capsys) -> None:
+    a, b = _declared_pairs(tmp_path, b_options={"shape_mix_sample_lengths": True, "qps_distribution": "constant"})
+    assert compare.main(["--a", *a, "--b", *b, "--expected-difference", "shape_mix_sample_lengths"]) == 2
+    err = capsys.readouterr().err
+    assert "workload option qps_distribution differs between runs" in err and "gamma" in err and "constant" in err
+    assert "shape_mix_sample_lengths differs" not in err
+    both = ["--expected-difference", "shape_mix_sample_lengths", "--expected-difference", "qps_distribution"]
+    assert compare.main(["--a", *a, "--b", *b, *both]) == 0
+    assert 'qps_distribution (A: "gamma", B: "constant")' in capsys.readouterr().out
+
+
+def test_u1_a_declared_name_that_does_not_differ_is_an_error(tmp_path, capsys) -> None:
+    a, b = _declared_pairs(tmp_path, b_options={"shape_mix_sample_lengths": True})
+    argv = ["--a", *a, "--b", *b, "--expected-difference", "shape_mix_sample_lengths"]
+    assert compare.main(argv + ["--expected-difference", "qps_distribution"]) == 2  # a typo'd or absent difference
+    assert "declared difference not present: qps_distribution" in capsys.readouterr().err
+    same, same_b = _declared_pairs(tmp_path)
+    assert compare.main(["--a", *same, "--b", *same_b, "--expected-difference", "shape_mix_sample_lengths"]) == 2
+    assert "declared difference not present: shape_mix_sample_lengths" in capsys.readouterr().err
+    assert compare.main(["--a", *same, "--b", *same_b, "--expected-difference", "workload"]) == 2
+    assert "declared difference not present: workload" in capsys.readouterr().err
+
+
+def test_u1_unknown_names_are_an_error_listing_the_valid_ones(tmp_path, capsys) -> None:
+    a, b = _declared_pairs(tmp_path, b_options={"shape_mix_sample_lengths": True})
+    assert compare.main(["--a", *a, "--b", *b, "--expected-difference", "shape_mix_sample_length"]) == 1
+    err = capsys.readouterr().err
+    assert "unknown --expected-difference name(s) shape_mix_sample_length" in err
+    assert "shape_mix_sample_lengths" in err and "workload" in err and "rate" in err and "version" in err
+    assert compare.main(["--recipe", *a, "--expected-difference", "nonsense"]) == 1  # the recipe checks the names too
+
+
+def test_u1_a_declared_option_is_constant_within_a_side(tmp_path, capsys) -> None:
+    a, b = _declared_pairs(
+        tmp_path,
+        b_options={"shape_mix_sample_lengths": True},
+        b_extra=lambda i: {"Workload Options": _options_json(shape_mix_sample_lengths=i == 1)},
+    )
+    assert compare.main(["--a", *a, "--b", *b, "--expected-difference", "shape_mix_sample_lengths"]) == 2
+    assert "option shape_mix_sample_lengths is declared to differ between A and B but differs within B" in (
+        capsys.readouterr().err
+    )
+
+
+def test_u1_declared_options_need_the_summaries_options(tmp_path, capsys) -> None:
+    a, b = _declared_pairs(
+        tmp_path, b_options={"shape_mix_sample_lengths": True}, b_extra=lambda i: {"Workload Options": ""}
+    )
+    assert compare.main(["--a", *a, "--b", *b, "--expected-difference", "shape_mix_sample_lengths"]) == 2
+    assert "lacks Workload Options" in capsys.readouterr().err
+
+
+def test_u1_workload_rate_and_version_are_declared_by_name(tmp_path, capsys) -> None:
+    a, b = _pairs(tmp_path, b_extra=lambda i: {"Workload Sha256": "def"})
+    assert compare.main(["--a", *a, "--b", *b]) == 2
+    capsys.readouterr()
+    assert compare.main(["--a", *a, "--b", *b, "--expected-difference", "workload"]) == 0
+    captured = capsys.readouterr()
+    assert "workload (A: abc, B: def)" in captured.out
+    assert "B's warm-up requests themselves differ" in captured.out  # the workload is what is sent
+    # constant within a side: B's second run on yet another workload is not "the" declared difference
+    a, b = _pairs(tmp_path, b_extra=lambda i: {"Workload Sha256": f"def{i}"})
+    assert compare.main(["--a", *a, "--b", *b, "--expected-difference", "workload"]) == 2
+    assert "declared to differ between A and B but differs within B" in capsys.readouterr().err
+    # the rate: a Target Qps that differs, with the qps option in the options JSON (the same difference)
+    a, b = _declared_pairs(
+        tmp_path, a_options={"qps": 3.0}, b_options={"qps": 5.0}, b_extra=lambda i: {"Target Qps": "5.0"}
+    )
+    assert compare.main(["--a", *a, "--b", *b]) == 2
+    capsys.readouterr()
+    assert compare.main(["--a", *a, "--b", *b, "--expected-difference", "rate"]) == 0
+    out = capsys.readouterr().out
+    assert "rate (A: 40.0, B: 5.0)" in out and "B's warm-up requests themselves differ" not in out
+    # the version
+    a, b = _pairs(tmp_path, b_extra=lambda i: {"Llm Bench Version": "2"})
+    assert compare.main(["--a", *a, "--b", *b, "--expected-difference", "version"]) == 0
+    out = capsys.readouterr().out
+    assert "version (A: 1, B: 2)" in out and "B's warm-up requests themselves differ" not in out
+
+
+def test_u1_the_pair_rules_stay(tmp_path, capsys) -> None:
+    declared = ["--expected-difference", "shape_mix_sample_lengths"]
+    a, b = _declared_pairs(
+        tmp_path,
+        b_options={"shape_mix_sample_lengths": True},
+        b_extra=lambda i: {"Request Seed": "9"} if i == 1 else {},
+    )
+    assert compare.main(["--a", *a, "--b", *b, *declared]) == 2
+    assert "pair 2: request seed: A 101 vs B 9" in capsys.readouterr().err
+    a, b = _declared_pairs(
+        tmp_path,
+        b_options={"shape_mix_sample_lengths": True},
+        b_extra=lambda i: {"Warmup Requests": "1"} if i == 2 else {},
+    )
+    assert compare.main(["--a", *a, "--b", *b, *declared]) == 2
+    assert "pair 3: warm-up requests: A 52 vs B 1" in capsys.readouterr().err
+    a, b = _declared_pairs(
+        tmp_path,
+        b_options={"shape_mix_sample_lengths": True},
+        a_extra=lambda i: {"Request Seed": "5"},
+        b_extra=lambda i: {"Request Seed": "5"},
+    )
+    assert compare.main(["--a", *a, "--b", *b, *declared]) == 2
+    assert "request seed 5 is the same in pairs 1, 2, 3" in capsys.readouterr().err
+
+
+def test_u1_the_recipe_names_what_the_variant_is_expected_to_differ_in(tmp_path, capsys) -> None:
+    a, _ = _declared_pairs(tmp_path)
+    out = tmp_path / "recipe.json"
+    assert compare.main(["--recipe", *a, "--expected-difference", "shape_mix_sample_lengths", "--json", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "expected to differ in the variant: shape_mix_sample_lengths (baseline false)" in printed
+    assert "workload options" not in printed.splitlines()[3].split("; the other")[0]  # the options hash is not to match
+    assert "the other workload options as in the baseline's Workload Options" in printed
+    result = json.loads(out.read_text())
+    assert "Workload Options Sha256" not in result["identity"] and "Workload Sha256" in result["identity"]
+    assert result["declared_differences"] == [{"name": "shape_mix_sample_lengths", "baseline": "false"}]
+    assert result["workload_options"] == {"qps_distribution": "gamma", "run_time_s": 60}  # without the declared one
+    assert compare.main(["--recipe", *a, "--expected-difference", "workload"]) == 0
+    printed = capsys.readouterr().out
+    assert (
+        "expected to differ in the variant: workload (baseline abc)" in printed
+        and "workload file sha256" not in printed
+    )
+
+
+def test_u1_the_declarable_options_are_llm_benchs_workload_options() -> None:
+    assert list(compare.WORKLOAD_OPTION_NAMES) == [*load_test.WORKLOAD_OPTIONS, "run_time_s"]

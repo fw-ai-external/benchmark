@@ -1,7 +1,8 @@
 """Compare two sets of llm_bench summaries (A = without a change, B = with it) from their --summary-file CSVs.
 
     python -m llm_bench.compare --a A1.csv [A2.csv ...] --b B1.csv [B2.csv ...] [--min-noise 0.03] \\
-        [--min-repeats 3] [--restarted-between-runs] [--json out.json] [--markdown out.md]
+        [--min-repeats 3] [--restarted-between-runs] [--expected-difference NAME ...] [--json out.json] \\
+        [--markdown out.md]
     python -m llm_bench.compare --recipe A1.csv [A2.csv ...] [--json recipe.json]
 
 --recipe prints, for a baseline's runs, each pair's `--request-seed s_i --warmup-requests N_i` (what every later
@@ -17,6 +18,15 @@ the request seed and the warm-up requests must match; across all the runs the wo
 that change the traffic (replayed pod, retiming, arrival process, -t, corpus, tokenizer, output mode, chat mode ...),
 the target rate and the llm_bench version must match; and the seeds must differ from pair to pair. Otherwise this
 refuses (exit 2) and says which differ. Rows that are not measured runs (a --prefix-fill step) are ignored, and said so.
+
+--expected-difference NAME (repeatable) declares a difference between A and B so the comparison is of A vs B under it:
+a workload option name (e.g. shape_mix_sample_lengths, qps_distribution; run_time_s for -t), `workload` (the workload
+files' sha), `rate` (the target rate) or `version`. A declared item must be constant within each side and differ
+between them, every other item still matches exactly (an undeclared difference refuses and is named), a declared name
+that does not differ is an error, an unknown name is an error listing the valid ones. Under `workload` or an option,
+B's warm-up requests differ from A's (the same count, different traffic), which is noted. The output lists each
+declared name with A's and B's values (JSON: declared_differences). With --recipe it names what the variant is
+expected to differ in.
 
 Else each metric's verdict comes from the paired relative deltas (A_i vs B_i): their mean against a noise floor of
 max(--min-noise, the spread (max - min) of the per-pair deltas). Inside the floor it reads "same", unless the floor is
@@ -130,12 +140,58 @@ SHARED_IDENTITY = [i for i in IDENTITY if i[0] not in ("Request Seed", "Warmup R
 PAIR_IDENTITY = [i for i in IDENTITY if i[0] in ("Request Seed", "Warmup Requests")]
 
 
-def identity_differences(a: list[dict[str, str]], b: list[dict[str, str]]) -> list[str]:
-    """Why the runs can't be compared, empty when they can: unequal counts (they are paired in order), a pair whose
-    seed or warm-up requests differ, a seed repeated across pairs, or a workload identity that differs anywhere."""
+# What `--expected-difference` takes: the workload options (llm_bench's WORKLOAD_OPTIONS, and -t as run_time_s; a test
+# keeps this list equal to llm_bench's) and the names of the other identity items.
+WORKLOAD_OPTION_NAMES = (
+    "replay_pod replay_pods replay_pod_index replay_retime replay_retime_min_parent_gap replay_template_subtraction "
+    "replay_pool_prefix replay_late_rows qps qps_distribution qps_cv2 qps_dispersion qps_modulation_window "
+    "qps_max_lateness shape_mix_corpus shape_mix_instruction shape_mix_output_mode shape_mix_sample_lengths "
+    "shape_mix_tail_variants tokenizer chat chat_head_tokens prefix_popularity_zipf prefix_restore_boundary "
+    "prefix_reuse_overhang served_model_config max_tokens max_tokens_cap max_tokens_distribution max_tokens_range "
+    "prompt_tokens reasoning_effort temperature top_k n stream ignore_eos force_min_tokens logprobs cancel_rate "
+    "lora_adapters run_time_s"
+).split()
+# The names of the identity columns: `workload` (the workload files' sha: two mix files or schedules), `rate` (the
+# target rate; the `qps` option is the same difference) and `version` (llm_bench's)
+IDENTITY_NAMES = {"workload": "Workload Sha256", "rate": "Target Qps", "version": "Llm Bench Version"}
+VALID_DIFFERENCE_NAMES = sorted(set(WORKLOAD_OPTION_NAMES) | set(IDENTITY_NAMES))
+
+
+def unknown_differences(declared: list[str]) -> list[str]:
+    return [name for name in declared if name not in VALID_DIFFERENCE_NAMES]
+
+
+def _declared_column(column: str, declared: set) -> bool:
+    """Whether an identity column may differ between A and B because its name was declared."""
+    for name, col in IDENTITY_NAMES.items():
+        if col == column and (name in declared or (name == "rate" and "qps" in declared)):
+            return True
+    return False
+
+
+def _options_of(row: dict[str, str]) -> Optional[dict]:
+    try:
+        options = json.loads(row.get("Workload Options", ""))
+    except ValueError:
+        return None
+    return options if isinstance(options, dict) else None
+
+
+def _option_declared(key: str, declared: set) -> bool:
+    return key in declared or (key == "qps" and "rate" in declared)
+
+
+def check_identity(
+    a: list[dict[str, str]], b: list[dict[str, str]], declared: tuple = ()
+) -> tuple[list[str], list[str]]:
+    """(why the runs can't be compared, declared differences that are not there). Both empty when they can: unequal
+    counts (they are paired in order), a pair whose seed or warm-up requests differ, a seed repeated across pairs, or a
+    workload identity that differs anywhere but in what was declared (`--expected-difference`): a declared item
+    must be constant within each side and differ between them, and every other item matches exactly."""
     if len(a) != len(b):
-        return [f"A has {len(a)} run(s) and B {len(b)}: runs are paired in order (A_i with B_i)"]
-    problems = []
+        return [f"A has {len(a)} run(s) and B {len(b)}: runs are paired in order (A_i with B_i)"], []
+    declared = set(declared)
+    problems, absent = [], []
     for column, label in PAIR_IDENTITY:
         for i, (ra, rb) in enumerate(zip(a, b), 1):
             if not _same(ra.get(column, ""), rb.get(column, ""), column):
@@ -151,7 +207,22 @@ def identity_differences(a: list[dict[str, str]], b: list[dict[str, str]]) -> li
             f"first run's prompts into the cache it left; give each pair its own --request-seed"
         )
     runs = a + b
+    declared_options = {name for name in declared if name in WORKLOAD_OPTION_NAMES or name == "rate"} - set(
+        IDENTITY_NAMES
+    ) | ({"qps"} if "rate" in declared else set())
     for column, label in SHARED_IDENTITY:
+        if column == "Workload Options Sha256" and declared_options:
+            continue  # checked option by option below
+        if _declared_column(column, declared):
+            for side, rows in (("A", a), ("B", b)):
+                found = [r.get(column, "") for r in rows]
+                if not all(_same(found[0], v, column) for v in found):
+                    problems.append(
+                        f"{label} is declared to differ between A and B but differs within {side}: {sorted(set(found))}"
+                    )
+            if _same(a[0].get(column, ""), b[0].get(column, ""), column):
+                absent.append(_declared_name_of(column, declared))
+            continue
         found = [r.get(column, "") for r in runs]
         if not all(_same(found[0], v, column) for v in found):
             detail = ""
@@ -161,7 +232,71 @@ def identity_differences(a: list[dict[str, str]], b: list[dict[str, str]]) -> li
             problems.append(f"{label} differs between runs: {sorted(set(found))}" + (f" ({detail})" if detail else ""))
         elif not found[0] and column in ("Workload Sha256", "Workload Options Sha256", "Llm Bench Version"):
             problems.append(f"{label} is missing from the summaries: not written by a warm-up-aware llm_bench")
-    return problems
+    if declared_options:
+        parsed = [_options_of(r) for r in runs]
+        if any(o is None for o in parsed):
+            problems.append("a summary lacks Workload Options: the declared option differences can't be checked")
+        else:
+            options_a, options_b = parsed[: len(a)], parsed[len(a) :]
+            for key in sorted({k for o in parsed for k in o} - {"request_seed"}):
+                values = lambda rows: [json.dumps(o.get(key), sort_keys=True) for o in rows]
+                va, vb = values(options_a), values(options_b)
+                if _option_declared(key, declared):
+                    for side, found in (("A", va), ("B", vb)):
+                        if len(set(found)) > 1:
+                            problems.append(
+                                f"option {key} is declared to differ between A and B but differs within {side}: "
+                                f"{sorted(set(found))}"
+                            )
+                    if set(va) == set(vb) and len(set(va)) == 1 and key in declared:
+                        absent.append(key)
+                elif len(set(va + vb)) > 1:
+                    problems.append(
+                        f"workload option {key} differs between runs: A {sorted(set(va))} vs B {sorted(set(vb))}"
+                    )
+            for name in declared:
+                if name in WORKLOAD_OPTION_NAMES and name != "qps" and name not in {k for o in parsed for k in o}:
+                    absent.append(name)
+    return problems, sorted(set(absent))
+
+
+def _declared_name_of(column: str, declared: set) -> str:
+    for name, col in IDENTITY_NAMES.items():
+        if col == column:
+            return "qps" if name == "rate" and "rate" not in declared else name
+    return column
+
+
+def identity_differences(a: list[dict[str, str]], b: list[dict[str, str]]) -> list[str]:
+    """Why the runs can't be compared, empty when they can (no declared differences)."""
+    return check_identity(a, b)[0]
+
+
+def declared_differences(a: list[dict[str, str]], b: list[dict[str, str]], declared: list[str]) -> list[dict[str, str]]:
+    """Each declared name with A's and B's value (the first run's: they are constant within a side)."""
+    out = []
+    for name in dict.fromkeys(declared):
+        if name in IDENTITY_NAMES:
+            column = IDENTITY_NAMES[name]
+            va, vb = a[0].get(column, ""), b[0].get(column, "")
+            if name == "workload":
+                va, vb = va[:12], vb[:12]
+        else:
+            options_a, options_b = _options_of(a[0]) or {}, _options_of(b[0]) or {}
+            va, vb = json.dumps(options_a.get(name)), json.dumps(options_b.get(name))
+        out.append({"name": name, "a": va, "b": vb})
+    return out
+
+
+def warmup_traffic_note(declared: list[str]) -> list[str]:
+    """When what is sent differs between A and B (the workload, or an option that shapes the traffic), B's warm-up
+    requests are the same in number as A's (it is given A's count) but not the same requests."""
+    if any(name == "workload" or name in WORKLOAD_OPTION_NAMES for name in declared):
+        return [
+            "B's warm-up requests themselves differ from A's under the declared difference: the same count, but "
+            "different traffic"
+        ]
+    return []
 
 
 def _number(row: dict[str, str], column: str) -> Optional[float]:
@@ -357,10 +492,13 @@ def warnings_for(
     return ([], [SAME_ENDPOINT_NOTE + where]) if restarted else ([SAME_ENDPOINT_WARNING + where], [])
 
 
-def recipe(rows: list[dict[str, str]]) -> dict[str, Any]:
+def recipe(rows: list[dict[str, str]], declared: tuple = ()) -> dict[str, Any]:
     """What a later variant run must use to be paired with these baseline runs: per pair its `--request-seed s_i
     --warmup-requests N_i`, and the workload identity it must match. Raises ValueError when the rows are not a valid
-    baseline (a seed or warm-up count missing, a repeated seed, runs of different workloads)."""
+    baseline (a seed or warm-up count missing, a repeated seed, runs of different workloads). With declared differences
+    (--expected-difference) the variant is expected to differ in them: they leave the identity it must match (a
+    declared option takes the options hash with it, and the remaining options are listed instead) and are listed as
+    expected to differ, with the baseline's value."""
     problems = []
     for i, row in enumerate(rows, 1):
         for column, label in PAIR_IDENTITY:
@@ -384,15 +522,41 @@ def recipe(rows: list[dict[str, str]]) -> dict[str, Any]:
                 "flags": f"--request-seed {row['Request Seed']} {warm}",
             }
         )
-    return {"pairs": pairs, "identity": {column: rows[0].get(column, "") for column, _ in SHARED_IDENTITY}}
+    declared_set = set(declared)
+    declared_options = {n for n in declared_set if n in WORKLOAD_OPTION_NAMES}
+    identity = {
+        column: rows[0].get(column, "")
+        for column, _ in SHARED_IDENTITY
+        if not _declared_column(column, declared_set) and not (declared_options and column == "Workload Options Sha256")
+    }
+    result: dict[str, Any] = {"pairs": pairs, "identity": identity}
+    if declared:
+        result["declared_differences"] = [
+            {"name": d["name"], "baseline": d["a"]} for d in declared_differences(rows, rows, list(declared))
+        ]
+        if declared_options:
+            options = _options_of(rows[0]) or {}
+            result["workload_options"] = {
+                k: v for k, v in options.items() if k != "request_seed" and not _option_declared(k, declared_set)
+            }
+    return result
 
 
 def recipe_text(result: dict[str, Any]) -> str:
     identity = result["identity"]
     lines = [f"pair {p['pair']}: {p['flags']}" for p in result["pairs"]]
     lines.append(
-        "must match: " + ", ".join(f"{label} {identity[column] or '(none)'}" for column, label in SHARED_IDENTITY)
+        "must match: "
+        + ", ".join(
+            f"{label} {identity[column] or '(none)'}" for column, label in SHARED_IDENTITY if column in identity
+        )
+        + ("; the other workload options as in the baseline's Workload Options" if "workload_options" in result else "")
     )
+    if result.get("declared_differences"):
+        lines.append(
+            "expected to differ in the variant: "
+            + ", ".join(f"{d['name']} (baseline {d['baseline']})" for d in result["declared_differences"])
+        )
     return "\n".join(lines)
 
 
@@ -407,9 +571,11 @@ def markdown(
     flagged: Optional[list] = None,
     warnings: Optional[list] = None,
     notes: Optional[list] = None,
+    header: Optional[str] = None,
 ) -> str:
     lines = (
-        [f"!!! WARNING: {w}" for w in warnings or []]
+        ([header] if header else [])
+        + [f"!!! WARNING: {w}" for w in warnings or []]
         + [f"NOTE: {n}" for n in notes or []]
         + [
             f"A: {a_runs} run(s), B: {b_runs} run(s), paired in order",
@@ -456,6 +622,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="You state the server was restarted before every run: A and B sharing a host is then a note, not a "
         "warning.",
     )
+    parser.add_argument(
+        "--expected-difference",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="A difference between A and B you declare (repeatable), so compare judges A vs B under it instead of "
+        "refusing: a workload option name (llm_bench's WORKLOAD_OPTIONS, e.g. shape_mix_sample_lengths, "
+        "qps_distribution; run_time_s for -t), or workload (the workload files' sha: two mix files or schedules), "
+        "rate (the target rate) or version (llm_bench's). A declared item is constant within each side and differs "
+        "between them; every other item must still match exactly, and a declared name that does not differ is an "
+        "error. With --recipe it names what the variant is expected to differ in.",
+    )
     parser.add_argument("--min-noise", type=float, default=0.03, help="Least noise floor (default 0.03).")
     parser.add_argument(
         "--min-repeats",
@@ -471,6 +649,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("give --a and --b to compare, or --recipe for a baseline's flags")
     if args.recipe is not None and (args.a or args.b):
         parser.error("--recipe goes alone (with --allow-flagged, if the baseline has flagged runs)")
+    unknown = unknown_differences(args.expected_difference)
+    if unknown:
+        print(
+            f"compare: unknown --expected-difference name(s) {', '.join(unknown)}; valid: "
+            f"{', '.join(VALID_DIFFERENCE_NAMES)}",
+            file=sys.stderr,
+        )
+        return 1
+    declared_names = list(dict.fromkeys(args.expected_difference))
     try:
         ignored: list[str] = []
         if args.recipe is not None:
@@ -478,7 +665,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             for note in ignored:
                 print(f"compare: ignoring {note} (not a measured run)", file=sys.stderr)
             try:
-                result = recipe(rows)
+                result = recipe(rows, tuple(declared_names))
             except ValueError as e:
                 print(f"compare: {e}", file=sys.stderr)
                 return 2
@@ -500,11 +687,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         a, b = read_rows(args.a, ignored), read_rows(args.b, ignored)
         for note in ignored:
             print(f"compare: ignoring {note} (not a measured run)", file=sys.stderr)
-        problems = identity_differences(a, b)
+        problems, absent = check_identity(a, b, tuple(declared_names))
         if problems:
             print("Refusing to compare: the two sides differ in their workload identity:", file=sys.stderr)
             for problem in problems:
                 print(f"  - {problem}", file=sys.stderr)
+            return 2
+        if absent:
+            print(
+                f"Refusing to compare: declared difference not present: {', '.join(absent)} (A and B agree there: "
+                f"a typo, or the runs do not differ in it)",
+                file=sys.stderr,
+            )
             return 2
         flagged = flagged_runs("A", a) + flagged_runs("B", b)
         if flagged and not args.allow_flagged:
@@ -522,6 +716,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             return EXIT_FLAGGED
         results = compare(a, b, args.min_noise, args.min_repeats)
         warnings, notes = warnings_for(a, b, args.restarted_between_runs)
+        declared = declared_differences(a, b, declared_names)
+        header = (
+            "Comparing A vs B under declared differences: "
+            + ", ".join(f"{d['name']} (A: {d['a']}, B: {d['b']})" for d in declared)
+            if declared
+            else None
+        )
+        notes = notes + warmup_traffic_note(declared_names)
+        if header:
+            print(f"compare: {header}", file=sys.stderr)
         for warning in warnings:
             print(f"compare: !!! WARNING: {warning}", file=sys.stderr)
         for note in notes:
@@ -536,12 +740,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "flagged_runs": flagged,
                         "warnings": warnings,
                         "notes": notes,
+                        "declared_differences": declared,
                         "ignored": ignored,
                     },
                     f,
                     indent=2,
                 )
-        table = markdown(results, len(a), len(b), flagged, warnings, notes)
+        table = markdown(results, len(a), len(b), flagged, warnings, notes, header)
         if args.markdown:
             with open(args.markdown, "w") as f:
                 f.write(table)
