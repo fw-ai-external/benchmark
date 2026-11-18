@@ -3643,8 +3643,8 @@ def test_startup_offset_reports_the_first_send_after_spawn() -> None:
 
 def test_unproven_switches_default_off(tmp_path) -> None:
     """The unproven features ship behind switches that default to off, even when the profile carries the data
-    they would use: gamma arrivals, rate modulation, per-request length sampling, retimed replay and the
-    instruction suffix."""
+    they would use: gamma arrivals, rate modulation, retimed replay and the instruction suffix. (Per-request length
+    sampling is on by default: see test_sample_lengths_is_the_default_and_can_be_turned_off.)"""
     from locust.argument_parser import get_empty_argument_parser, setup_parser_arguments
 
     mix = json.loads(json.dumps(MIX))
@@ -3658,7 +3658,6 @@ def test_unproven_switches_default_off(tmp_path) -> None:
     assert opts.qps_distribution == "constant"  # gamma arrivals: opt in with --qps-distribution gamma
     assert opts.qps_modulation_window is None  # rate modulation: opt in with --qps-modulation-window
     assert load_test.rate_block_windows(opts) is None
-    assert opts.shape_mix_sample_lengths is False  # per-request length sampling from the class quantiles
     assert opts.replay_retime is None  # retimed replay
     assert opts.shape_mix_instruction is None  # the instruction suffix
 
@@ -4046,3 +4045,27 @@ def test_replay_reuse_records_carry_the_schedule_row(tmp_path) -> None:
     m = re.search(_TASK15_REUSE_RE, line)
     assert m.group(6) == "900" and m.group(7) == "7"  # task 15's parser reads it
     assert re.search(_TASK15_REUSE_RE, line.replace(" row=7", "")).group(7) is None  # absent on draws
+
+
+def test_sample_lengths_is_the_default_and_can_be_turned_off(tmp_path):
+    """Fixed lengths collapse the latency distribution, so sampling is on unless --no-shape-mix-sample-lengths."""
+    from locust.argument_parser import get_empty_argument_parser, setup_parser_arguments
+
+    path = tmp_path / "mix.json"
+    path.write_text(json.dumps(MIX))
+    parser = get_empty_argument_parser()
+    setup_parser_arguments(parser)
+    load_test.init_parser(parser)
+    base = ["--provider", "vllm", "-m", "m", "--no-chat", "--shape-mix", f"@{path}"]
+    assert parser.parse_args(base).shape_mix_sample_lengths is True
+    assert parser.parse_args([*base, "--no-shape-mix-sample-lengths"]).shape_mix_sample_lengths is False
+
+
+def test_sample_lengths_without_quantiles_is_flagged():
+    """A mix whose classes carry no quantiles sends the class means even with sampling on: llm_bench warns."""
+    without = argparse.Namespace(shape_mix=json.dumps(MIX), shape_mix_sample_lengths=True)
+    assert load_test.sample_lengths_without_quantiles(without)
+    off = argparse.Namespace(shape_mix=json.dumps(MIX), shape_mix_sample_lengths=False)
+    assert not load_test.sample_lengths_without_quantiles(off)
+    sampled = argparse.Namespace(shape_mix=json.dumps(SAMPLED_MIX), shape_mix_sample_lengths=True)
+    assert not load_test.sample_lengths_without_quantiles(sampled)
