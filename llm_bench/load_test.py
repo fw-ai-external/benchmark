@@ -5192,6 +5192,11 @@ def validate_shape_mix_options(options: argparse.Namespace) -> None:
                     f"{pool}" + ("" if pool else " (the class has no shared prefix)")
                 )
     plan = warmup_plan(options)  # a bad warm-up flag or workload block fails here, before anything is built
+    if sample_lengths_without_quantiles(options):
+        logger.warning(
+            "!!! --shape-mix-sample-lengths: no class of the mix has length quantiles, so lengths stay at the class "
+            "means (one length per class). Rebuild the profile with --quantiles for realistic lengths"
+        )
     for difference in warmup_sized_for_differences(options):
         logger.warning(
             f"!!! {difference}: the workload file's warmup block says its prefix pool was sized for a different "
@@ -5644,6 +5649,15 @@ def _same_to_6_digits(a: float, b: float) -> bool:
     the run's own value is compared as that printed text, not by a tolerance a rounding can exceed (7/3 stored as
     2.33333 is 1.4e-6 off)."""
     return f"{a:.6g}" == f"{b:.6g}"
+
+
+def sample_lengths_without_quantiles(options: argparse.Namespace) -> bool:
+    """--shape-mix-sample-lengths is on but no class of the mix has length quantiles, so every request keeps its
+    class's mean lengths: the same traffic as --no-shape-mix-sample-lengths."""
+    if not getattr(options, "shape_mix", None) or not getattr(options, "shape_mix_sample_lengths", False):
+        return False
+    classes = parse_shape_mix(options.shape_mix).classes
+    return not any(c.uncached_tokens_quantiles or c.generated_tokens_quantiles for c in classes)
 
 
 def warmup_sized_for_differences(options: argparse.Namespace) -> list[str]:
@@ -8377,14 +8391,16 @@ def init_parser(parser):
     )
     parser.add_argument(
         "--shape-mix-sample-lengths",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="For --shape-mix: draw each request's uncached prompt tokens and output tokens from the class's "
         "uncached_tokens_quantiles and generated_tokens_quantiles ({'p10': n, 'p50': n, ...} or [[q, n], ...]), "
         "by piecewise-linear inverse CDF, instead of using the class means. The cached share stays fixed. Uncached "
         "lengths are sampled in 19 weighted strata reaching the top quantile (one precomputed tail each), output lengths "
         "continuously; both are scaled to keep the class mean. "
-        "Classes without quantiles keep their means. Off by default.",
+        "Classes without quantiles keep their means (a warning says when no class has any). On by default: fixed "
+        "lengths collapse the latency distribution (one length per class); --no-shape-mix-sample-lengths restores "
+        "them, e.g. to compare with runs made before this default.",
     )
     parser.add_argument(
         "--prefix-popularity-zipf",
