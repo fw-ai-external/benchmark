@@ -31,10 +31,11 @@ def test_unique_images_differ_in_bytes_and_pixels() -> None:
     assert all(_decode(image).size == (64, 48) for image in images)
 
 
-def test_prompt_images_unique_flag_defaults_off() -> None:
+def test_prompt_images_unique_defaults_on() -> None:
     base = ["-H", "https://api.fireworks.ai/inference", "--provider", "fireworks", "--model", MODEL, "--chat"]
-    assert get_parser().parse_args(base).prompt_images_unique is False
+    assert get_parser().parse_args(base).prompt_images_unique is True
     assert get_parser().parse_args([*base, "--prompt-images-unique"]).prompt_images_unique is True
+    assert get_parser().parse_args([*base, "--no-prompt-images-unique"]).prompt_images_unique is False
 
 
 def test_unique_images_do_not_block_the_event_loop() -> None:
