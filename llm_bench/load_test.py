@@ -501,8 +501,26 @@ def add_custom_metric(name, value, length_value=0):
     )
 
 
+def generation_window(t_first: float, t_last: float, num_tokens: int):
+    """(seconds, intervals) spanned by decode after the first token, or None when there is no interval.
+
+    N streamed tokens arrive at N instants, which bound N - 1 inter-token intervals: the first token lands at the
+    start of the window, so it is not generated inside it. The window ends at the last token, not at stream end,
+    so the trailing usage chunk and [DONE] are not counted as generation. Assumes one token per streamed chunk
+    for the first token (true for Fireworks and vLLM/SGLang default streaming); a provider that coalesces several
+    tokens into its first chunk is still slightly over-reported."""
+    if not num_tokens or num_tokens < 2 or t_first is None or t_last is None or t_last <= t_first:
+        return None
+    return t_last - t_first, num_tokens - 1
+
+
 def track_performance_metrics(
-    response_time: float, token_count: int, char_count: int, prompt_tokens: int = None, ttft: float = None
+    response_time: float,
+    token_count: int,
+    char_count: int,
+    prompt_tokens: int = None,
+    ttft: float = None,
+    last_token_time: float = None,
 ):
     """Track comprehensive performance metrics for parity with Customers load_test.py."""
     metrics = {
@@ -519,10 +537,9 @@ def track_performance_metrics(
 
     if ttft:
         metrics["ttft"] = ttft
-        metrics["generation_time"] = response_time - ttft
-        metrics["generation_tokens_per_second"] = (
-            token_count / (response_time - ttft) if (response_time - ttft) > 0 else 0
-        )
+        window = generation_window(ttft, last_token_time if last_token_time is not None else response_time, token_count)
+        metrics["generation_time"] = window[0] if window else 0
+        metrics["generation_tokens_per_second"] = window[1] / window[0] if window else 0
 
     for metric_name, metric_value in metrics.items():
         add_custom_metric(metric_name, metric_value, token_count)
@@ -6454,6 +6471,7 @@ class LLMUser(HttpUser):
                 return
             t_first_token = None
             t_first_visible_token = None
+            t_last_token = None
 
             # Rerank and embeddings are single-response JSON APIs. Draining them through
             # iter_lines(delimiter=b"\n\n") makes the interpreter scan the whole body for a
@@ -6553,6 +6571,8 @@ class LLMUser(HttpUser):
                     # some providers (SGLang) send an empty chunk first skewing the TTFT;
                     # completion_tokens handles invisible-token deployments where combined_text
                     # stays empty but usage.completion_tokens is non-zero (e.g. Maverick-style)
+                    if out.text:
+                        t_last_token = now
                     if (combined_text or completion_tokens) and t_first_token is None:
                         t_first_token = now
                         # Randomly cancel after first token if cancel_rate is set
@@ -6611,6 +6631,8 @@ class LLMUser(HttpUser):
             # Fall back to t_first_token if no visible content ever arrived (e.g. all-thinking response)
             t_effective_first = (t_first_visible_token or t_first_token) if use_first_visible else t_first_token
 
+            # Invisible-token deployments stream no text: fall back to stream end for the last token.
+            t_last_generated = t_last_token if t_last_token is not None and t_last_token >= t_effective_first else now
             dur_generation = now - t_effective_first
             dur_first_token = t_effective_first - t_start
 
@@ -6665,6 +6687,7 @@ class LLMUser(HttpUser):
                 char_count=num_chars,
                 prompt_tokens=prompt_tokens,
                 ttft=dur_first_token,
+                last_token_time=t_last_generated - t_start,
             )
             if num_chars:
                 add_custom_metric("latency_per_char", dur_generation / num_chars * 1000, num_chars)
@@ -6678,7 +6701,9 @@ class LLMUser(HttpUser):
                 add_custom_metric("generation_tokens", num_tokens)  # backward-compat alias; see logging_params
                 add_custom_metric("completion_tokens", num_tokens)
                 add_custom_metric("num_tokens", num_tokens)
-                add_custom_metric("latency_per_token", dur_generation / num_tokens * 1000, num_tokens)
+                window = generation_window(t_effective_first, t_last_generated, num_tokens)
+                if window:
+                    add_custom_metric("latency_per_token", window[0] / window[1] * 1000, num_tokens)
                 add_custom_metric(
                     "overall_latency_per_token",
                     dur_total / num_tokens * 1000,
