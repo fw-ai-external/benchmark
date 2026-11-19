@@ -38,6 +38,7 @@ from PIL import Image
 import transformers
 import re
 import gevent
+import gevent.threadpool
 import gevent.event
 import gevent.pool
 import urllib3
@@ -5570,6 +5571,20 @@ def _load_curl_like_data(text):
 _SYSTEMONE_WORKER_SEEDS = itertools.count()
 
 
+# Two threads build about 14 batches of 40 756x756 images per second per process while keeping a 1 ms gevent
+# timer within ~5 ms; four threads contend for the GIL and let it slip to ~26 ms. Created lazily so each
+# --processes worker builds its own.
+IMAGE_BUILD_THREADS = 2
+_image_build_threadpool = None
+
+
+def _image_build_pool():
+    global _image_build_threadpool
+    if _image_build_threadpool is None:
+        _image_build_threadpool = gevent.threadpool.ThreadPool(IMAGE_BUILD_THREADS)
+    return _image_build_threadpool
+
+
 class LLMUser(HttpUser):
     # no wait time, so every user creates a continuous load, sending requests as quickly as possible
 
@@ -5690,7 +5705,7 @@ class LLMUser(HttpUser):
         self._designed_cached_tokens = None
 
         image_resolutions = self.environment.parsed_options.prompt_images_with_resolutions
-        self.prompt_images = None
+        self.prompt_image_resolutions = []
         if self.environment.parsed_options.first_visible_token:
             if not self.environment.parsed_options.chat:
                 raise AssertionError(
@@ -5712,7 +5727,7 @@ class LLMUser(HttpUser):
                 # e.g., <|image|> for Phi, <|image_pad|> for Qwen, <image> for Llava
                 # So using /completions endpoint requires a bit more work to support this
                 raise AssertionError("--prompt-images-with-resolutions is only supported with --chat mode.")
-            self.prompt_images = [self._create_base64_image(width, height) for width, height in image_resolutions]
+            self.prompt_image_resolutions = list(image_resolutions)
 
         self.max_tokens_sampler = LengthSampler(
             distribution=self.environment.parsed_options.max_tokens_distribution,
@@ -5922,18 +5937,33 @@ class LLMUser(HttpUser):
         )
 
     def _create_base64_image(self, width, height):
-        """Create a random RGB image with the given dimensions and return as base64 data URI."""
-        img = Image.new("RGB", (width, height))
+        """Create a unique RGB image with the given dimensions and return it as a base64 data URI.
+
+        A random fill plus a random 8x8 corner patch means no two images share pixels or bytes, so the
+        server can't serve them from its image or prefix cache and the vision encoder runs on every image.
+        """
+        img = Image.new("RGB", (width, height), tuple(random.randrange(256) for _ in range(3)))
+        img.paste(Image.frombytes("RGB", (8, 8), os.urandom(8 * 8 * 3)))
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG")
         img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{img_str}"
 
+    def _create_images(self):
+        """Build one request's fresh images on a small native thread pool and wait cooperatively.
+
+        PIL fills and JPEG-encodes with the GIL released, so this keeps other users' response reads and
+        scheduled sends on time instead of stalling the event loop for the whole batch.
+        """
+        return _image_build_pool().apply(
+            lambda: [self._create_base64_image(w, h) for w, h in self.prompt_image_resolutions]
+        )
+
     def _get_input(self):
         prompt, prompt_tokens = next(self.dataset)
 
-        if self.prompt_images:
-            images = self.prompt_images
+        if self.prompt_image_resolutions:
+            images = self._create_images()
             prompt_images_positioning = self.environment.parsed_options.prompt_images_positioning
             prompt = self.insert_image_placeholders(prompt, len(images), prompt_images_positioning)
         else:
