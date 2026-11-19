@@ -38,6 +38,7 @@ from PIL import Image
 import transformers
 import re
 import gevent
+import gevent.threadpool
 import gevent.event
 import gevent.pool
 import urllib3
@@ -5570,6 +5571,20 @@ def _load_curl_like_data(text):
 _SYSTEMONE_WORKER_SEEDS = itertools.count()
 
 
+# Two threads build about 14 batches of 40 756x756 images per second per process while keeping a 1 ms gevent
+# timer within ~5 ms; four threads contend for the GIL and let it slip to ~26 ms. Created lazily so each
+# --processes worker builds its own.
+UNIQUE_IMAGE_THREADS = 2
+_unique_image_threadpool = None
+
+
+def _unique_image_pool():
+    global _unique_image_threadpool
+    if _unique_image_threadpool is None:
+        _unique_image_threadpool = gevent.threadpool.ThreadPool(UNIQUE_IMAGE_THREADS)
+    return _unique_image_threadpool
+
+
 class LLMUser(HttpUser):
     # no wait time, so every user creates a continuous load, sending requests as quickly as possible
 
@@ -5939,12 +5954,22 @@ class LLMUser(HttpUser):
         img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{img_str}"
 
+    def _create_unique_images(self):
+        """Build one request's fresh images on a small native thread pool and wait cooperatively.
+
+        PIL fills and JPEG-encodes with the GIL released, so this keeps other users' response reads and
+        scheduled sends on time instead of stalling the event loop for the whole batch.
+        """
+        return _unique_image_pool().apply(
+            lambda: [self._create_base64_image(w, h, unique=True) for w, h in self.prompt_image_resolutions]
+        )
+
     def _get_input(self):
         prompt, prompt_tokens = next(self.dataset)
 
         if self.prompt_images:
             if self.environment.parsed_options.prompt_images_unique:
-                images = [self._create_base64_image(w, h, unique=True) for w, h in self.prompt_image_resolutions]
+                images = self._create_unique_images()
             else:
                 images = self.prompt_images
             prompt_images_positioning = self.environment.parsed_options.prompt_images_positioning
