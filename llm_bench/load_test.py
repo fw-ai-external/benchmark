@@ -1302,15 +1302,15 @@ def _load_curl_like_data(text):
 # Two threads build about 14 batches of 40 756x756 images per second per process while keeping a 1 ms gevent
 # timer within ~5 ms; four threads contend for the GIL and let it slip to ~26 ms. Created lazily so each
 # --processes worker builds its own.
-UNIQUE_IMAGE_THREADS = 2
-_unique_image_threadpool = None
+IMAGE_BUILD_THREADS = 2
+_image_build_threadpool = None
 
 
-def _unique_image_pool():
-    global _unique_image_threadpool
-    if _unique_image_threadpool is None:
-        _unique_image_threadpool = gevent.threadpool.ThreadPool(UNIQUE_IMAGE_THREADS)
-    return _unique_image_threadpool
+def _image_build_pool():
+    global _image_build_threadpool
+    if _image_build_threadpool is None:
+        _image_build_threadpool = gevent.threadpool.ThreadPool(IMAGE_BUILD_THREADS)
+    return _image_build_threadpool
 
 
 class LLMUser(HttpUser):
@@ -1403,7 +1403,7 @@ class LLMUser(HttpUser):
         self.ramping_pacer = None  # Will be set if --ramping-time is used
 
         image_resolutions = self.environment.parsed_options.prompt_images_with_resolutions
-        self.prompt_images = None
+        self.prompt_image_resolutions = []
         if self.environment.parsed_options.first_visible_token:
             if not self.environment.parsed_options.chat:
                 raise AssertionError(
@@ -1424,7 +1424,6 @@ class LLMUser(HttpUser):
                 # So using /completions endpoint requires a bit more work to support this
                 raise AssertionError("--prompt-images-with-resolutions is only supported with --chat mode.")
             self.prompt_image_resolutions = list(image_resolutions)
-            self.prompt_images = [self._create_base64_image(width, height) for width, height in image_resolutions]
 
         self.max_tokens_sampler = LengthSampler(
             distribution=self.environment.parsed_options.max_tokens_distribution,
@@ -1509,41 +1508,34 @@ class LLMUser(HttpUser):
             synthetic_prompt = "\n\n".join(PROMPT_PREFIX_TOKEN * tokens_per_doc for _ in range(num_docs))
             self.dataset = iter(itertools.cycle([(synthetic_prompt, num_docs * tokens_per_doc)]))
 
-    def _create_base64_image(self, width, height, unique=False):
-        """Create an RGB image with the given dimensions and return as base64 data URI.
+    def _create_base64_image(self, width, height):
+        """Create a unique RGB image with the given dimensions and return it as a base64 data URI.
 
-        By default the image is solid black, so every call returns identical bytes. With ``unique``
-        it gets a random fill and a random 8x8 corner patch, so no two images share pixels or bytes
-        and the server cannot serve them from its image or prefix cache.
+        A random fill plus a random 8x8 corner patch means no two images share pixels or bytes, so the
+        server can't serve them from its image or prefix cache and the vision encoder runs on every image.
         """
-        if unique:
-            img = Image.new("RGB", (width, height), tuple(random.randrange(256) for _ in range(3)))
-            img.paste(Image.frombytes("RGB", (8, 8), os.urandom(8 * 8 * 3)))
-        else:
-            img = Image.new("RGB", (width, height))
+        img = Image.new("RGB", (width, height), tuple(random.randrange(256) for _ in range(3)))
+        img.paste(Image.frombytes("RGB", (8, 8), os.urandom(8 * 8 * 3)))
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG")
         img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{img_str}"
 
-    def _create_unique_images(self):
+    def _create_images(self):
         """Build one request's fresh images on a small native thread pool and wait cooperatively.
 
         PIL fills and JPEG-encodes with the GIL released, so this keeps other users' response reads and
         scheduled sends on time instead of stalling the event loop for the whole batch.
         """
-        return _unique_image_pool().apply(
-            lambda: [self._create_base64_image(w, h, unique=True) for w, h in self.prompt_image_resolutions]
+        return _image_build_pool().apply(
+            lambda: [self._create_base64_image(w, h) for w, h in self.prompt_image_resolutions]
         )
 
     def _get_input(self):
         prompt, prompt_tokens = next(self.dataset)
 
-        if self.prompt_images:
-            if self.environment.parsed_options.prompt_images_unique:
-                images = self._create_unique_images()
-            else:
-                images = self.prompt_images
+        if self.prompt_image_resolutions:
+            images = self._create_images()
             prompt_images_positioning = self.environment.parsed_options.prompt_images_positioning
             prompt = self.insert_image_placeholders(prompt, len(images), prompt_images_positioning)
         else:
@@ -2028,16 +2020,6 @@ def init_parser(parser):
         help="How to position the images in the prompt. "
         "space-evenly: images are spaced out evenly across the prompt. E.g., 3 images in 'abcdefgh' is 'ab<image>cd<image>ef<image>gh'"
         "end: images are added to the end of the prompt. E.g., 3 images in 'abcdefgh' is 'abcdefgh<image><image><image>'"
-        "Only relevant with --prompt-images-with-resolutions.",
-    )
-    parser.add_argument(
-        "--prompt-images-unique",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Generate fresh images for every request (random fill plus a random 8x8 patch), so images are never "
-        "served from the server's image or prefix cache and the vision encoder runs on every image. On by "
-        "default; costs roughly 2 ms of client CPU per image on a background thread. --no-prompt-images-unique "
-        "reuses one solid-black image per user instead, which the server caches after the first request. "
         "Only relevant with --prompt-images-with-resolutions.",
     )
     parser.add_argument(
