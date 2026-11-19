@@ -35,3 +35,28 @@ def test_prompt_images_unique_flag_defaults_off() -> None:
     base = ["-H", "https://api.fireworks.ai/inference", "--provider", "fireworks", "--model", MODEL, "--chat"]
     assert get_parser().parse_args(base).prompt_images_unique is False
     assert get_parser().parse_args([*base, "--prompt-images-unique"]).prompt_images_unique is True
+
+
+def test_unique_images_do_not_block_the_event_loop() -> None:
+    import gevent
+
+    class _User:
+        prompt_image_resolutions = [(756, 756)] * 40
+        _create_base64_image = LLMUser._create_base64_image
+        _create_unique_images = LLMUser._create_unique_images
+
+    ticks = []
+
+    def ticker() -> None:
+        while True:
+            gevent.sleep(0.001)
+            ticks.append(1)
+
+    tk = gevent.spawn(ticker)
+    gevent.sleep(0.005)
+    ticks.clear()
+    images = _User()._create_unique_images()
+    tk.kill()
+    assert len(images) == 40 and len(set(images)) == 40
+    # Built inline, the batch holds the loop for its whole duration and the ticker fires at most once.
+    assert len(ticks) >= 5
