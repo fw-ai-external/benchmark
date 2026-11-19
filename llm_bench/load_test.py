@@ -5712,6 +5712,7 @@ class LLMUser(HttpUser):
                 # e.g., <|image|> for Phi, <|image_pad|> for Qwen, <image> for Llava
                 # So using /completions endpoint requires a bit more work to support this
                 raise AssertionError("--prompt-images-with-resolutions is only supported with --chat mode.")
+            self.prompt_image_resolutions = list(image_resolutions)
             self.prompt_images = [self._create_base64_image(width, height) for width, height in image_resolutions]
 
         self.max_tokens_sampler = LengthSampler(
@@ -5921,9 +5922,18 @@ class LLMUser(HttpUser):
             f"{len(ds.question_ids)} questions of ~{max(ds.question_tokens)} tokens"
         )
 
-    def _create_base64_image(self, width, height):
-        """Create a random RGB image with the given dimensions and return as base64 data URI."""
-        img = Image.new("RGB", (width, height))
+    def _create_base64_image(self, width, height, unique=False):
+        """Create an RGB image with the given dimensions and return as base64 data URI.
+
+        By default the image is solid black, so every call returns identical bytes. With ``unique``
+        it gets a random fill and a random 8x8 corner patch, so no two images share pixels or bytes
+        and the server cannot serve them from its image or prefix cache.
+        """
+        if unique:
+            img = Image.new("RGB", (width, height), tuple(random.randrange(256) for _ in range(3)))
+            img.paste(Image.frombytes("RGB", (8, 8), os.urandom(8 * 8 * 3)))
+        else:
+            img = Image.new("RGB", (width, height))
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG")
         img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -5933,7 +5943,10 @@ class LLMUser(HttpUser):
         prompt, prompt_tokens = next(self.dataset)
 
         if self.prompt_images:
-            images = self.prompt_images
+            if self.environment.parsed_options.prompt_images_unique:
+                images = [self._create_base64_image(w, h, unique=True) for w, h in self.prompt_image_resolutions]
+            else:
+                images = self.prompt_images
             prompt_images_positioning = self.environment.parsed_options.prompt_images_positioning
             prompt = self.insert_image_placeholders(prompt, len(images), prompt_images_positioning)
         else:
@@ -6971,6 +6984,15 @@ def init_parser(parser):
         help="How to position the images in the prompt. "
         "space-evenly: images are spaced out evenly across the prompt. E.g., 3 images in 'abcdefgh' is 'ab<image>cd<image>ef<image>gh'"
         "end: images are added to the end of the prompt. E.g., 3 images in 'abcdefgh' is 'abcdefgh<image><image><image>'"
+        "Only relevant with --prompt-images-with-resolutions.",
+    )
+    parser.add_argument(
+        "--prompt-images-unique",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Generate fresh images for every request (random fill plus a random 8x8 patch) instead of reusing "
+        "one solid-black image per user, so images are never served from the server's image or prefix cache "
+        "and the vision encoder runs on every image. Costs roughly 1-3 ms of client CPU per image. "
         "Only relevant with --prompt-images-with-resolutions.",
     )
     parser.add_argument(
