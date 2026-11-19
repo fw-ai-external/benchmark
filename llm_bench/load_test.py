@@ -2033,10 +2033,11 @@ def init_parser(parser):
     parser.add_argument(
         "--prompt-images-unique",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Generate fresh images for every request (random fill plus a random 8x8 patch) instead of reusing "
-        "one solid-black image per user, so images are never served from the server's image or prefix cache "
-        "and the vision encoder runs on every image. Costs roughly 1-3 ms of client CPU per image. "
+        default=True,
+        help="Generate fresh images for every request (random fill plus a random 8x8 patch), so images are never "
+        "served from the server's image or prefix cache and the vision encoder runs on every image. On by "
+        "default; costs roughly 2 ms of client CPU per image on a background thread. --no-prompt-images-unique "
+        "reuses one solid-black image per user instead, which the server caches after the first request. "
         "Only relevant with --prompt-images-with-resolutions.",
     )
     parser.add_argument(
