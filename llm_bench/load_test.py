@@ -619,9 +619,26 @@ class JsonlDataset:
         self.path = path
         self.shuffle_seed = shuffle_seed
         self.dataset_limit = dataset_limit
+        self._items = None
+        self._cycle = None
 
     def __iter__(self):
-        return itertools.cycle(self._read_data())
+        # Every user calls iter(dataset) in on_start, so hand them all one cycle and let them take consecutive lines.
+        # A cycle per user would have each user replay the file from line 0: concurrent users would send identical
+        # requests (inflating prompt-cache hits) and each would hold its own copy of the file.
+        if self._cycle is None:
+            self._cycle = itertools.cycle(self._load())
+        return self._cycle
+
+    def first_prompt(self):
+        """The first line's prompt, without taking it from the shared iterator."""
+        items = self._load()
+        return items[0][0] if items else None
+
+    def _load(self):
+        if self._items is None:
+            self._items = list(self._read_data())
+        return self._items
 
     def _read_data(self):
         # Read all data into a list first (needed for shuffling and limiting)
@@ -3043,9 +3060,17 @@ class DatasetHolder:
     _prompt_tokens_estimate = None
 
     @classmethod
-    def prompt_token_estimate(cls, options: argparse.Namespace, get_input) -> int:
+    def prompt_token_estimate(cls, options: argparse.Namespace, get_input, dataset=None) -> int:
         """Prompt tokens to report when the server doesn't, once per process: the mean of the dataset's own counts
         over a few prompts when it carries them (variable-length datasets), else one prompt tokenized."""
+        if cls._prompt_tokens_estimate is None and isinstance(dataset, JsonlDataset):
+            # Peek rather than take a line from the iterator all users share. A line is usually a request body (a
+            # dict), which the tokenizer can't count; the server's usage reports its prompt tokens instead.
+            prompt = dataset.first_prompt()
+            if isinstance(prompt, str):
+                cls._prompt_tokens_estimate = len(InitTracker.load_tokenizer(options.tokenizer).encode(prompt))
+            else:
+                cls._prompt_tokens_estimate = 0
         if cls._prompt_tokens_estimate is None:
             prompt, prompt_tokens, _ = get_input()
             if prompt_tokens:
@@ -5869,7 +5894,7 @@ class LLMUser(HttpUser):
         # Once per process, not per user: users start inside the run window, and tokenizing a long prompt for
         # each of them blocked the event loop there
         self.prompt_tokenizer_tokens = DatasetHolder.prompt_token_estimate(
-            self.environment.parsed_options, self._get_input
+            self.environment.parsed_options, self._get_input, dataset
         )
 
         # Override dataset with synthetic rerank documents if num_documents or tokens_per_document is set
