@@ -105,10 +105,12 @@ def test_each_test_run_rereads_the_file_from_line_0(jsonl: Path, monkeypatch: py
     assert user._get_input()[0] == _chat_line(0)
     assert user._get_input()[0] == _chat_line(1)
 
-    # The Locust UI stops the run, the file changes, and a new run starts in the same process
+    # The Locust UI stops the run, the file changes, and a new run starts in the same process with the same dataset
     jsonl.write_text(json.dumps(_chat_line(7)) + "\n")
     load_test._reset_jsonl_dataset(environment=user.environment)
-    assert _start(monkeypatch, jsonl)._get_input()[0] == _chat_line(7)
+    rerun_user = _user(jsonl)
+    rerun_user._on_start()
+    assert rerun_user._get_input()[0] == _chat_line(7)
 
 
 def test_string_line_count_includes_image_placeholders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
