@@ -272,9 +272,31 @@ class JsonlDataset:
         self.path = path
         self.shuffle_seed = shuffle_seed
         self.dataset_limit = dataset_limit
+        self._items = None
+        self._cycle = None
 
     def __iter__(self):
-        return itertools.cycle(self._read_data())
+        # Every user calls iter(dataset) in on_start, so hand them all one cycle and let them take consecutive lines.
+        # A cycle per user would have each user replay the file from line 0: concurrent users would send identical
+        # requests (inflating prompt-cache hits) and each would hold its own copy of the file.
+        if self._cycle is None:
+            self._cycle = itertools.cycle(self._load())
+        return self._cycle
+
+    def reset(self):
+        """Reread the file and start again from line 0 on the next iter()."""
+        self._items = None
+        self._cycle = None
+
+    def first_prompt(self):
+        """The first line's prompt, without taking it from the shared iterator."""
+        items = self._load()
+        return items[0][0] if items else None
+
+    def _load(self):
+        if self._items is None:
+            self._items = list(self._read_data())
+        return self._items
 
     def _read_data(self):
         # Read all data into a list first (needed for shuffling and limiting)
@@ -668,6 +690,14 @@ class InitTracker:
 events.spawning_complete.add_listener(InitTracker.notify_spawning_complete)
 
 
+@events.test_start.add_listener
+def _reset_jsonl_dataset(**_kwargs):
+    # A Locust UI process can run several tests; each starts from line 0 of the file as it is now, as it did when
+    # every user read the file itself. test_start fires before any user of the run starts.
+    if isinstance(DatasetHolder._instance, JsonlDataset):
+        DatasetHolder._instance.reset()
+
+
 def _parse_run_time_to_seconds(run_time_value):
     """Parse Locust -t/--run-time value into seconds (float). Supports both
     already-parsed numeric values and human strings like '30s', '5m', '1h30m'.
@@ -868,8 +898,9 @@ class OpenAIProvider(BaseProvider):
             and len(data["messages"]) > 0
         ):
             # Remove the last message if it's from assistant
+            # Slice rather than pop: for a JSONL row, data["messages"] is the dataset's own list, reused every pass
             if data["messages"][-1].get("role") == "assistant":
-                data["messages"].pop()
+                data["messages"] = data["messages"][:-1]
 
         return data
 
@@ -1036,6 +1067,7 @@ class FireworksProvider(OpenAIProvider):
         Only records speculation hit rates for generations with >= 30 tokens to ensure
         meaningful statistics.
         """
+
         def get_perf_metric(name):
             value = (perf_metrics or {}).get(name)
             if value is None:
@@ -1493,8 +1525,24 @@ class LLMUser(HttpUser):
         dataset = DatasetHolder.get_instance(self.environment.parsed_options)
         self.dataset = iter(dataset)
 
-        tokenizer = InitTracker.load_tokenizer(self.environment.parsed_options.tokenizer)
-        self.prompt_tokenizer_tokens = len(tokenizer.encode(self._get_input()[0]))
+        if isinstance(dataset, JsonlDataset):
+            # Peek rather than take a line from the iterator all users share. A line is usually a request body (a
+            # dict), which the tokenizer can't count; the server's usage reports its prompt tokens instead.
+            prompt = dataset.first_prompt()
+            if isinstance(prompt, str):
+                if self.prompt_image_resolutions:
+                    prompt = self.insert_image_placeholders(
+                        prompt,
+                        len(self.prompt_image_resolutions),
+                        self.environment.parsed_options.prompt_images_positioning,
+                    )
+                tokenizer = InitTracker.load_tokenizer(self.environment.parsed_options.tokenizer)
+                self.prompt_tokenizer_tokens = len(tokenizer.encode(prompt))
+            else:
+                self.prompt_tokenizer_tokens = 0
+        else:
+            tokenizer = InitTracker.load_tokenizer(self.environment.parsed_options.tokenizer)
+            self.prompt_tokenizer_tokens = len(tokenizer.encode(self._get_input()[0]))
 
         # Override dataset with synthetic rerank documents if num_documents or tokens_per_document is set
         if self.environment.parsed_options.rerank and (
