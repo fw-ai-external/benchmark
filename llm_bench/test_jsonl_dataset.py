@@ -8,7 +8,7 @@ from locust.argument_parser import get_parser
 from locust.env import Environment
 
 import load_test
-from load_test import DatasetHolder, InitTracker, JsonlDataset, LLMUser
+from load_test import PROMPT_CHAT_IMAGE_PLACEHOLDER, DatasetHolder, InitTracker, JsonlDataset, LLMUser
 
 HOST = "https://api.fireworks.ai/inference"
 MODEL = "accounts/pyroworks/deployments/test"
@@ -42,9 +42,9 @@ class _User(LLMUser):
     host = HOST  # locust's runner sets this from --host before spawning
 
 
-def _user(jsonl: Path) -> LLMUser:
+def _user(jsonl: Path, *flags: str) -> LLMUser:
     options = get_parser().parse_args(
-        ["-H", HOST, "--provider", "fireworks", "--model", MODEL, "--chat", "--dataset", f"@{jsonl}"]
+        ["-H", HOST, "--provider", "fireworks", "--model", MODEL, "--chat", "--dataset", f"@{jsonl}", *flags]
     )
     return _User(Environment(user_classes=[_User], host=HOST, parsed_options=options))
 
@@ -71,3 +71,51 @@ def test_on_start_with_chat_jsonl(jsonl: Path, monkeypatch: pytest.MonkeyPatch) 
     assert second_user._get_input()[0] == _chat_line(1)
     payload = first_user.provider_formatter.format_payload(prompt, 16, images)
     assert payload["messages"] == _chat_line(0)["messages"]
+
+
+def _start(monkeypatch: pytest.MonkeyPatch, jsonl: Path, *flags: str) -> LLMUser:
+    monkeypatch.setattr(DatasetHolder, "_instance", None)
+    monkeypatch.setattr(DatasetHolder, "_prompt_tokens_estimate", None)
+    monkeypatch.setattr(load_test.time, "sleep", lambda _: None)
+    user = _user(jsonl, *flags)
+    user._on_start()
+    return user
+
+
+def test_clear_assistant_leaves_the_shared_row_intact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    messages = [
+        {"role": "user", "content": "U"},
+        {"role": "assistant", "content": "A"},
+        {"role": "assistant", "content": "B"},
+    ]
+    path = tmp_path / "chat.jsonl"
+    path.write_text(json.dumps({"messages": messages}) + "\n")
+    monkeypatch.setattr(InitTracker, "load_tokenizer", lambda _path: pytest.fail("no tokenizer for a request body"))
+    user = _start(monkeypatch, path, "--clear-assistant")
+
+    # Two passes through the one-line cycle send the same request, and the dataset's row keeps all three turns
+    first, second = (user.provider_formatter.format_payload(user._get_input()[0], 16, None) for _ in range(2))
+    assert first["messages"] == second["messages"] == messages[:2]
+    assert DatasetHolder._instance.first_prompt()["messages"] == messages
+
+
+def test_each_test_run_rereads_the_file_from_line_0(jsonl: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(InitTracker, "load_tokenizer", lambda _path: pytest.fail("no tokenizer for a request body"))
+    user = _start(monkeypatch, jsonl)
+    assert user._get_input()[0] == _chat_line(0)
+    assert user._get_input()[0] == _chat_line(1)
+
+    # The Locust UI stops the run, the file changes, and a new run starts in the same process
+    jsonl.write_text(json.dumps(_chat_line(7)) + "\n")
+    load_test._reset_jsonl_dataset(environment=user.environment)
+    assert _start(monkeypatch, jsonl)._get_input()[0] == _chat_line(7)
+
+
+def test_string_line_count_includes_image_placeholders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "prompts.jsonl"
+    path.write_text(json.dumps("hello") + "\n")
+    tokenizer = type("CharTokenizer", (), {"encode": staticmethod(list)})()
+    monkeypatch.setattr(InitTracker, "load_tokenizer", lambda _path: tokenizer)
+    user = _start(monkeypatch, path, "--prompt-images-with-resolutions", "8x8", "--prompt-images-positioning", "end")
+    assert user.prompt_tokenizer_tokens == len("hello" + PROMPT_CHAT_IMAGE_PLACEHOLDER)
+    assert user._get_input()[0] == "hello" + PROMPT_CHAT_IMAGE_PLACEHOLDER  # the peek took no line

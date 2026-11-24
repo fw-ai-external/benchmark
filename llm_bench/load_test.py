@@ -630,6 +630,11 @@ class JsonlDataset:
             self._cycle = itertools.cycle(self._load())
         return self._cycle
 
+    def reset(self):
+        """Reread the file and start again from line 0 on the next iter()."""
+        self._items = None
+        self._cycle = None
+
     def first_prompt(self):
         """The first line's prompt, without taking it from the shared iterator."""
         items = self._load()
@@ -3060,13 +3065,16 @@ class DatasetHolder:
     _prompt_tokens_estimate = None
 
     @classmethod
-    def prompt_token_estimate(cls, options: argparse.Namespace, get_input, dataset=None) -> int:
+    def prompt_token_estimate(cls, options: argparse.Namespace, get_input, peek_prompt=None) -> int:
         """Prompt tokens to report when the server doesn't, once per process: the mean of the dataset's own counts
-        over a few prompts when it carries them (variable-length datasets), else one prompt tokenized."""
-        if cls._prompt_tokens_estimate is None and isinstance(dataset, JsonlDataset):
-            # Peek rather than take a line from the iterator all users share. A line is usually a request body (a
-            # dict), which the tokenizer can't count; the server's usage reports its prompt tokens instead.
-            prompt = dataset.first_prompt()
+        over a few prompts when it carries them (variable-length datasets), else one prompt tokenized.
+
+        peek_prompt, given for JSONL datasets, returns the first line's prompt as it would be sent without taking the
+        line from the iterator all users share."""
+        if cls._prompt_tokens_estimate is None and peek_prompt is not None:
+            # A line is usually a request body (a dict), which the tokenizer can't count; the server's usage reports
+            # its prompt tokens instead.
+            prompt = peek_prompt()
             if isinstance(prompt, str):
                 cls._prompt_tokens_estimate = len(InitTracker.load_tokenizer(options.tokenizer).encode(prompt))
             else:
@@ -4575,6 +4583,15 @@ class InitTracker:
 events.spawning_complete.add_listener(InitTracker.notify_spawning_complete)
 
 
+@events.test_start.add_listener
+def _reset_jsonl_dataset(**_kwargs):
+    # A Locust UI process can run several tests; each starts from line 0 of the file as it is now, as it did when
+    # every user read the file itself. test_start fires before any user of the run starts.
+    if isinstance(DatasetHolder._instance, JsonlDataset):
+        DatasetHolder._instance.reset()
+        DatasetHolder._prompt_tokens_estimate = None
+
+
 def _parse_run_time_to_seconds(run_time_value):
     """Parse Locust -t/--run-time value into seconds (float). Supports both
     already-parsed numeric values and human strings like '30s', '5m', '1h30m'.
@@ -5148,8 +5165,9 @@ class OpenAIProvider(BaseProvider):
             and len(data["messages"]) > 0
         ):
             # Remove the last message if it's from assistant
+            # Slice rather than pop: for a JSONL row, data["messages"] is the dataset's own list, reused every pass
             if data["messages"][-1].get("role") == "assistant":
-                data["messages"].pop()
+                data["messages"] = data["messages"][:-1]
 
         return data
 
@@ -5894,7 +5912,9 @@ class LLMUser(HttpUser):
         # Once per process, not per user: users start inside the run window, and tokenizing a long prompt for
         # each of them blocked the event loop there
         self.prompt_tokenizer_tokens = DatasetHolder.prompt_token_estimate(
-            self.environment.parsed_options, self._get_input, dataset
+            self.environment.parsed_options,
+            self._get_input,
+            partial(self._first_jsonl_prompt, dataset) if isinstance(dataset, JsonlDataset) else None,
         )
 
         # Override dataset with synthetic rerank documents if num_documents or tokens_per_document is set
@@ -5953,6 +5973,15 @@ class LLMUser(HttpUser):
         img.save(buffer, format="JPEG")
         img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{img_str}"
+
+    def _first_jsonl_prompt(self, dataset):
+        """Line 0's prompt as _get_input would send it, without taking the line from the shared iterator."""
+        prompt = dataset.first_prompt()
+        if isinstance(prompt, str) and self.prompt_images:
+            prompt = self.insert_image_placeholders(
+                prompt, len(self.prompt_images), self.environment.parsed_options.prompt_images_positioning
+            )
+        return prompt
 
     def _get_input(self):
         prompt, prompt_tokens = next(self.dataset)
