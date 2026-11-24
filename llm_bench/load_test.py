@@ -272,9 +272,26 @@ class JsonlDataset:
         self.path = path
         self.shuffle_seed = shuffle_seed
         self.dataset_limit = dataset_limit
+        self._items = None
+        self._cycle = None
 
     def __iter__(self):
-        return itertools.cycle(self._read_data())
+        # Every user calls iter(dataset) in on_start, so hand them all one cycle and let them take consecutive lines.
+        # A cycle per user would have each user replay the file from line 0: concurrent users would send identical
+        # requests (inflating prompt-cache hits) and each would hold its own copy of the file.
+        if self._cycle is None:
+            self._cycle = itertools.cycle(self._load())
+        return self._cycle
+
+    def first_prompt(self):
+        """The first line's prompt, without taking it from the shared iterator."""
+        items = self._load()
+        return items[0][0] if items else None
+
+    def _load(self):
+        if self._items is None:
+            self._items = list(self._read_data())
+        return self._items
 
     def _read_data(self):
         # Read all data into a list first (needed for shuffling and limiting)
@@ -1036,6 +1053,7 @@ class FireworksProvider(OpenAIProvider):
         Only records speculation hit rates for generations with >= 30 tokens to ensure
         meaningful statistics.
         """
+
         def get_perf_metric(name):
             value = (perf_metrics or {}).get(name)
             if value is None:
@@ -1493,8 +1511,18 @@ class LLMUser(HttpUser):
         dataset = DatasetHolder.get_instance(self.environment.parsed_options)
         self.dataset = iter(dataset)
 
-        tokenizer = InitTracker.load_tokenizer(self.environment.parsed_options.tokenizer)
-        self.prompt_tokenizer_tokens = len(tokenizer.encode(self._get_input()[0]))
+        if isinstance(dataset, JsonlDataset):
+            # Peek rather than take a line from the iterator all users share. A line is usually a request body (a
+            # dict), which the tokenizer can't count; the server's usage reports its prompt tokens instead.
+            prompt = dataset.first_prompt()
+            if isinstance(prompt, str):
+                tokenizer = InitTracker.load_tokenizer(self.environment.parsed_options.tokenizer)
+                self.prompt_tokenizer_tokens = len(tokenizer.encode(prompt))
+            else:
+                self.prompt_tokenizer_tokens = 0
+        else:
+            tokenizer = InitTracker.load_tokenizer(self.environment.parsed_options.tokenizer)
+            self.prompt_tokenizer_tokens = len(tokenizer.encode(self._get_input()[0]))
 
         # Override dataset with synthetic rerank documents if num_documents or tokens_per_document is set
         if self.environment.parsed_options.rerank and (
