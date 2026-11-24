@@ -283,6 +283,11 @@ class JsonlDataset:
             self._cycle = itertools.cycle(self._load())
         return self._cycle
 
+    def reset(self):
+        """Reread the file and start again from line 0 on the next iter()."""
+        self._items = None
+        self._cycle = None
+
     def first_prompt(self):
         """The first line's prompt, without taking it from the shared iterator."""
         items = self._load()
@@ -685,6 +690,14 @@ class InitTracker:
 events.spawning_complete.add_listener(InitTracker.notify_spawning_complete)
 
 
+@events.test_start.add_listener
+def _reset_jsonl_dataset(**_kwargs):
+    # A Locust UI process can run several tests; each starts from line 0 of the file as it is now, as it did when
+    # every user read the file itself. test_start fires before any user of the run starts.
+    if isinstance(DatasetHolder._instance, JsonlDataset):
+        DatasetHolder._instance.reset()
+
+
 def _parse_run_time_to_seconds(run_time_value):
     """Parse Locust -t/--run-time value into seconds (float). Supports both
     already-parsed numeric values and human strings like '30s', '5m', '1h30m'.
@@ -885,8 +898,9 @@ class OpenAIProvider(BaseProvider):
             and len(data["messages"]) > 0
         ):
             # Remove the last message if it's from assistant
+            # Slice rather than pop: for a JSONL row, data["messages"] is the dataset's own list, reused every pass
             if data["messages"][-1].get("role") == "assistant":
-                data["messages"].pop()
+                data["messages"] = data["messages"][:-1]
 
         return data
 
@@ -1516,6 +1530,12 @@ class LLMUser(HttpUser):
             # dict), which the tokenizer can't count; the server's usage reports its prompt tokens instead.
             prompt = dataset.first_prompt()
             if isinstance(prompt, str):
+                if self.prompt_image_resolutions:
+                    prompt = self.insert_image_placeholders(
+                        prompt,
+                        len(self.prompt_image_resolutions),
+                        self.environment.parsed_options.prompt_images_positioning,
+                    )
                 tokenizer = InitTracker.load_tokenizer(self.environment.parsed_options.tokenizer)
                 self.prompt_tokenizer_tokens = len(tokenizer.encode(prompt))
             else:
